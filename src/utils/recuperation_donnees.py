@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+import os
+import subprocess
+import urllib.error
+
 
 from utils.creation_arborescence import ProjectPaths
 
@@ -72,6 +76,46 @@ def setup_logger(logs_dir: Path, name: str = "recuperation_donnees") -> logging.
 
     logger.info("Log file: %s", log_file)
     return logger
+
+def _log_proxy_env(logger) -> None:
+    """Log proxy-related environment variables (useful on servers)."""
+    keys = ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "all_proxy", "ALL_PROXY"]
+    vals = {k: os.environ.get(k) for k in keys if os.environ.get(k)}
+    if vals:
+        logger.info("Proxy env détecté: %s", vals)
+    else:
+        logger.info("Aucun proxy env détecté (http_proxy/https_proxy/no_proxy).")
+
+
+def _download_with_curl(url: str, dst_path: Path, logger, timeout_s: int = 300, retries: int = 5) -> None:
+    """
+    Download using curl (often more robust behind corporate proxies).
+    Uses resume (-C -) and follows redirects (-L).
+    """
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "curl",
+        "-L",                 # follow redirects
+        "-f",                 # fail on HTTP errors
+        "--retry", str(retries),
+        "--retry-delay", "3",
+        "--connect-timeout", "20",
+        "--max-time", str(timeout_s),
+        "-A", "mise_a_jour_mesh/1.0",
+        "-C", "-",            # resume if partial exists
+        "-o", str(dst_path),
+        url,
+    ]
+
+    logger.info("Téléchargement (curl): %s", " ".join(cmd))
+    p = subprocess.run(cmd, capture_output=True, text=True)
+
+    if p.returncode != 0:
+        stderr = (p.stderr or "").strip()
+        if stderr:
+            logger.error("curl stderr: %s", stderr)
+        raise RuntimeError(f"Echec curl (code={p.returncode}) pour {url}")
 
 
 def read_lidar_urls(txt_path: str | Path) -> list[str]:
@@ -230,41 +274,116 @@ def _filename_from_wmsr_url(wms_url: str, fallback: str) -> str:
 # -----------------------------
 # IO utilitaires (download/copy)
 # -----------------------------
-def download_file(url: str, dst_path: Path, tmp_dir: Path, logger: logging.Logger, timeout_s: int = 120) -> None:
-    """Télécharge un fichier en streaming vers .part puis move (évite fichiers partiels)."""
+def download_file(
+    url: str,
+    dst_path: Path,
+    tmp_dir: Path,
+    logger,
+    timeout_s: int = 300,
+    overwrite: bool = False,
+    use_curl_fallback: bool = True,
+) -> None:
+    """
+    Télécharge un fichier URL -> dst_path, avec:
+    - logs détaillés
+    - écriture via fichier .part dans tmp_dir (puis rename atomique)
+    - retries en cas d'erreurs transitoires (502/503/504, timeouts)
+    - fallback curl (optionnel) si urllib échoue (utile en environnement proxy)
+
+    Parameters
+    ----------
+    url : str
+        URL du fichier à télécharger.
+    dst_path : Path
+        Chemin final.
+    tmp_dir : Path
+        Dossier temporaire pour le fichier .part.
+    logger :
+        Logger (logging.Logger).
+    timeout_s : int
+        Timeout réseau pour urllib/curl.
+    overwrite : bool
+        Si False et dst existe => on skip.
+    use_curl_fallback : bool
+        Si True => fallback curl si urllib échoue.
+    """
+    dst_path = Path(dst_path)
+    tmp_dir = Path(tmp_dir)
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    if dst_path.exists():
-        logger.info("Déjà présent, skip: %s", dst_path.name)
+    if dst_path.exists() and not overwrite and dst_path.stat().st_size > 0:
+        logger.info("Déjà présent, skip: %s", dst_path)
         return
+
+    _log_proxy_env(logger)
 
     part_path = tmp_dir / (dst_path.name + ".part")
 
-    logger.info("Téléchargement: %s", url)
-    t0 = time.time()
-
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    # Nettoyage éventuel d'un vieux .part (si taille 0, ou si overwrite)
     try:
-        with urlopen(req, timeout=timeout_s) as resp, open(part_path, "wb") as f:
-            while True:
-                chunk = resp.read(1024 * 1024)  # 1 MB
-                if not chunk:
-                    break
-                f.write(chunk)
+        if part_path.exists() and (overwrite or part_path.stat().st_size == 0):
+            part_path.unlink()
     except Exception as e:
-        if part_path.exists():
-            try:
-                part_path.unlink()
-            except Exception:
-                pass
-        raise RuntimeError(f"Echec téléchargement: {url}: {e}") from e
+        logger.warning("Impossible de supprimer l'ancien .part (%s): %s", part_path, e)
 
-    shutil.move(str(part_path), str(dst_path))
-    dt = time.time() - t0
-    size_mb = dst_path.stat().st_size / (1024 * 1024)
-    logger.info("OK: %s (%.1f MB) en %.1f s", dst_path.name, size_mb, dt)
+    last_err = None
 
+    # --- tentative urllib (3 essais) ---
+    for attempt in range(1, 4):
+        try:
+            logger.info("Téléchargement (urllib) tentative %d/3: %s", attempt, url)
+
+            req = Request(url, headers={"User-Agent": "mise_a_jour_mesh/1.0"})
+
+            with urlopen(req, timeout=timeout_s) as resp:
+                status = getattr(resp, "status", None)
+                if status is not None:
+                    logger.info("HTTP status: %s", status)
+
+                # Écriture stream -> .part
+                with open(part_path, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+
+            # Vérif basique
+            if not part_path.exists() or part_path.stat().st_size == 0:
+                raise RuntimeError(f"Téléchargement vide (0 octet) pour {url}")
+
+            # Move atomique vers destination
+            part_path.replace(dst_path)
+
+            logger.info("OK téléchargé: %s (%.1f MB)", dst_path, dst_path.stat().st_size / (1024 * 1024))
+            return
+
+        except urllib.error.HTTPError as e:
+            last_err = e
+            logger.warning("HTTPError tentative %d/3: %s", attempt, e)
+
+            # Erreurs souvent transitoires côté proxy/gateway
+            if e.code in (502, 503, 504):
+                time.sleep(2 * attempt)
+                continue
+
+            # autres codes => pas de retry agressif
+            break
+
+        except Exception as e:
+            last_err = e
+            logger.warning("Erreur tentative %d/3: %s", attempt, e)
+            time.sleep(2 * attempt)
+
+    # --- fallback curl ---
+    if use_curl_fallback:
+        logger.warning("urllib en échec (%s). Fallback curl pour: %s", last_err, url)
+        _download_with_curl(url, dst_path, logger, timeout_s=timeout_s, retries=5)
+
+        if not dst_path.exists() or dst_path.stat().st_size == 0:
+            raise RuntimeError(f"Fallback curl a produit un fichier vide pour {url}")
+
+        logger.info("OK téléchargé (curl): %s (%.1f MB)", dst_path, dst_path.stat().st_size / (1024 * 1024))
+        return
+
+    raise RuntimeError(f"Echec téléchargement: {url}: {last_err}") from last_err
 
 def copy_if_needed(src: Path, dst: Path, logger: logging.Logger) -> None:
     """Copie src -> dst si dst n'existe pas."""

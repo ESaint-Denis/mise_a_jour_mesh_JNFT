@@ -14,8 +14,8 @@ from utils.recalage_altimetrique import RecalageConfig, run_recalage_altimetriqu
 from utils.creation_masque import MaskConfig, run_creation_masque
 from utils.fusion_nuages import FusionConfig, run_fusion_nuages
 
-PROJECT_DIR = r"C:\Projets\mise_a_jour_mesh\out_mise_a_jour_mesh_JNFT\test_dep76"
-LIDAR_URLS_TXT = r"C:\Projets\mise_a_jour_mesh\in_mise_a_jour_mesh_JNFT\test_dep76\dalles_test_76.txt"
+PROJECT_DIR = r"/media/DATA/MESH_3D/out_mise_a_jour_mesh_JNFT/test_dep76"
+LIDAR_URLS_TXT = r"/media/DATA/MESH_3D/out_mise_a_jour_mesh_JNFT/test_dep76/dalles_test_76.txt"
 
 MNS_YEAR_YYYY = 2025
 DEPARTEMENT = "76"
@@ -34,7 +34,7 @@ def main() -> None:
         cfg=cfg_retrieval,
         strict_missing_mns_correlation=True,
         fetch_mns_lidar=True,
-        strict_missing_mns_lidar=True,  # tu peux laisser True si tu veux que ça bloque
+        strict_missing_mns_lidar=True,
     )
 
     cfg_recal = RecalageConfig(

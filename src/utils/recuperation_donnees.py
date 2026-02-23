@@ -15,15 +15,19 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 import os
 import subprocess
 import urllib.error
+import platform
+from dataclasses import dataclass
+from datetime import datetime
 
 
 from utils.creation_arborescence import ProjectPaths
+from utils.departement_wfs import DepartementWfsConfig, get_departements_for_tile_bbox
 
 
 _TILE_RE = re.compile(r"_(\d{4})_(\d{4})_")
@@ -39,12 +43,17 @@ class MissingLidarDSMError(RuntimeError):
 
 @dataclass(frozen=True)
 class RetrievalConfig:
-    # MNS corrélation (store interne)
-    mns_year_yyyy: int           # ex: 2025
-    departement: str             # ex: "76"
-    store_root: Path = Path(r"\\store.ign.fr\store-REF\produits\modeles-numeriques-3D\MNS\MNS_CORREL_1-0_TIFF")
+    # Correlation DSM store
+    store_root: Path
 
-    # MNS LiDAR HD via WFS (annuaire) + WMS-R (téléchargement)
+    # Correlation DSM search policy
+    year_start: int = datetime.now().year   # search from current year downwards
+    year_stop: int = 2020                  # inclusive lower bound (adjust if needed)
+
+    # Department WFS
+    dep_wfs: DepartementWfsConfig = DepartementWfsConfig()
+
+    # LiDAR HD DSM via WFS/WMS-R (unchanged)
     wfs_endpoint: str = "https://data.geopf.fr/wfs/ows"
     wfs_type_name: str = "IGNF_MNS-LIDAR-HD:dalle"
     wfs_srs: str = "EPSG:2154"
@@ -85,6 +94,42 @@ def _log_proxy_env(logger) -> None:
         logger.info("Proxy env détecté: %s", vals)
     else:
         logger.info("Aucun proxy env détecté (http_proxy/https_proxy/no_proxy).")
+
+def resolve_store_root(cfg: RetrievalConfig) -> Path:
+    """
+    Resolve the store root path for MNS correlation tiles.
+
+    Priority:
+    1) cfg.store_root if provided
+    2) environment variable MNS_CORREL_STORE_ROOT
+    3) platform-based defaults (Linux mount path first, then UNC on Windows)
+    """
+    # 1) Explicit config
+    if cfg.store_root is not None:
+        return Path(cfg.store_root)
+
+    # 2) Environment override
+    env = os.environ.get("MNS_CORREL_STORE_ROOT")
+    if env:
+        return Path(env)
+
+    # 3) Defaults
+    candidates: list[Path] = []
+
+    # Linux mount (what your admin fixed)
+    candidates.append(Path("/media/stores/cifs/store-REF/produits/modeles-numeriques-3D/MNS/MNS_CORREL_1-0_TIFF"))
+
+    # Windows UNC (works when run on Windows)
+    candidates.append(Path(r"\\store.ign.fr\store-REF\produits\modeles-numeriques-3D\MNS\MNS_CORREL_1-0_TIFF"))
+
+    for p in candidates:
+        if p.exists():
+            return p
+
+    # If nothing exists, return the most likely default for the current OS (helps error messages)
+    if platform.system().lower().startswith("win"):
+        return candidates[1]
+    return candidates[0]
 
 
 def _download_with_curl(url: str, dst_path: Path, logger, timeout_s: int = 300, retries: int = 5) -> None:
@@ -164,29 +209,93 @@ def _km_to_m_str(km: int) -> str:
 # -----------------------------
 # MNS corrélation (store interne)
 # -----------------------------
-def build_mns_correlation_folder(cfg: RetrievalConfig) -> Path:
+def build_mns_correlation_folder(store_root: Path, year_yyyy: int, dep_code_insee: str) -> Path:
     """
-    Construit:
-    \\store...\MNS_CORREL_1-0_TIFF\LAMB93_{YYYY}\MNS_TIFF_RGF93LAMB93_{YY}FD{DEP}20\data
+    Build:
+    <store_root>/LAMB93_<YYYY>/MNS_TIFF_RGF93LAMB93_<YY>FD<DEP>20/data
     """
-    yyyy = int(cfg.mns_year_yyyy)
+    yyyy = int(year_yyyy)
     yy = yyyy % 100
-    dep = str(cfg.departement)
+    dep = str(dep_code_insee)
     lot = f"{yy:02d}FD{dep}20"
-    return cfg.store_root / f"LAMB93_{yyyy}" / f"MNS_TIFF_RGF93LAMB93_{lot}" / "data"
+    return Path(store_root) / f"LAMB93_{yyyy}" / f"MNS_TIFF_RGF93LAMB93_{lot}" / "data"
 
 
-def build_mns_correlation_filename(cfg: RetrievalConfig, x_km: int, y_km: int) -> str:
-    """Construit le nom de dalle MNS corrélation attendu à partir de (x_km, y_km)."""
-    yyyy = int(cfg.mns_year_yyyy)
+def build_mns_correlation_filename(year_yyyy: int, dep_code_insee: str, x_km: int, y_km: int) -> str:
+    """Build expected correlation DSM filename from (year, dep, x_km, y_km)."""
+    yyyy = int(year_yyyy)
     yy = yyyy % 100
-    dep = str(cfg.departement)
+    dep = str(dep_code_insee)
     lot = f"{yy:02d}FD{dep}20"
 
     x_m = _km_to_m_str(x_km)
     y_m = _km_to_m_str(y_km)
     return f"MNS_CORREL_1-0_LAMB93_{lot}_{x_m}_{y_m}.tif"
 
+def normalize_dep_code_for_store(dep: str) -> str:
+    """
+    Normalize department code for correlation DSM store naming.
+
+    Store convention:
+    - Corsica is stored as '20' (covers both 2A and 2B)
+    - Metropolitan departments use 2 digits (01..95)
+    - Overseas departments use 3 digits (971..976)
+    - WFS may return 3-digit with leading zero (e.g., '076')
+
+    Examples:
+    - '076' -> '76'
+    - '6'   -> '06'
+    - '06'  -> '06'
+    - '2A'  -> '20'
+    - '2B'  -> '20'
+    - '971' -> '971'
+    """
+    dep = str(dep).strip().upper()
+
+    # Corsica special case (store uses 20)
+    if dep in ("2A", "2B"):
+        return "20"
+
+    # Numeric codes
+    if dep.isdigit():
+        dep2 = dep.lstrip("0") or "0"
+        # Overseas (3 digits)
+        if len(dep2) >= 3:
+            return dep2
+        # Metropolitan (2 digits)
+        return dep2.zfill(2)
+
+    return dep
+
+
+def find_latest_mns_correlation_tile(
+    cfg: RetrievalConfig,
+    x_km: int,
+    y_km: int,
+) -> Path | None:
+    """
+    Find the newest available correlation DSM for a tile by:
+    1) listing intersecting departments (code_insee) via WFS
+    2) trying years from cfg.year_start down to cfg.year_stop
+    3) for each year, trying departments in decreasing intersection area order
+    Returns the first existing file path, or None if not found.
+    """
+    deps = get_departements_for_tile_bbox(x_km, y_km, cfg.dep_wfs)
+    dep_codes = [normalize_dep_code_for_store(d) for (d, _area) in deps]
+    seen = set()
+    dep_codes = [d for d in dep_codes if not (d in seen or seen.add(d))]
+    print(f"[DEBUG] tile {x_km:04d}_{y_km:04d} dep_codes={dep_codes}")
+    
+    for year in range(int(cfg.year_start), int(cfg.year_stop) - 1, -1):
+        for dep in dep_codes:
+            folder = build_mns_correlation_folder(cfg.store_root, year, dep)
+            name = build_mns_correlation_filename(year, dep, x_km, y_km)
+            p = folder / name
+            print(f"[DEBUG] try year={year} dep={dep} path={p}")
+            if p.exists():
+                return p
+
+    return None
 
 # -----------------------------
 # MNS LiDAR HD (WFS -> url WMS-R)
@@ -428,15 +537,21 @@ def run_retrieval(
 
     logger.info("Racine projet: %s", paths.root)
     logger.info("Fichier URLs LiDAR: %s", Path(lidar_urls_txt).resolve())
-    logger.info("Année MNS corrélation: %s", cfg.mns_year_yyyy)
-    logger.info("Département: %s", cfg.departement)
+    logger.info(
+        "MNS corrélation: auto-détection département via WFS (%s)",
+        cfg.dep_wfs.type_name,
+    )
+    logger.info(
+        "MNS corrélation: recherche années %d → %d",
+        cfg.year_start,
+        cfg.year_stop,
+    )
+    logger.info("MNS corrélation store root: %s", cfg.store_root)
     logger.info("Fetch MNS LiDAR HD via WFS: %s", fetch_mns_lidar)
 
     urls = read_lidar_urls(lidar_urls_txt)
     logger.info("URLs lues: %d", len(urls))
 
-    mns_corr_folder = build_mns_correlation_folder(cfg)
-    logger.info("Dossier MNS corrélation (source): %s", mns_corr_folder)
 
     for i, url in enumerate(urls, start=1):
         logger.info("---- Dalle %d / %d ----", i, len(urls))
@@ -453,23 +568,22 @@ def run_retrieval(
 
         # 2) Dalle MNS corrélation correspondante
         x_km, y_km = _parse_tile_xy_from_lidar_filename(lidar_name)
-        corr_name = build_mns_correlation_filename(cfg, x_km, y_km)
-        corr_src = mns_corr_folder / corr_name
-        corr_dst = paths.mns_correlation / corr_name
 
-        if not corr_src.exists():
-            msg = f"MNS corrélation manquant (store): {corr_src}"
+        corr_src = find_latest_mns_correlation_tile(cfg, x_km, y_km)
+        logger.info("MNS corrélation retenu: %s", corr_src)
+        if corr_src is None:
+            msg = (
+                f"MNS corrélation introuvable (store) pour tuile {x_km:04d}_{y_km:04d} "
+                f"en testant années {cfg.year_start}->{cfg.year_stop}"
+            )
             logger.error(msg)
             if strict_missing_mns_correlation:
                 raise MissingCorrelationDSMError(msg)
             else:
                 continue
 
-        try:
-            copy_if_needed(corr_src, corr_dst, logger)
-        except Exception as e:
-            logger.error("Erreur copie MNS corrélation %s: %s", corr_name, e)
-            raise
+        corr_dst = paths.mns_correlation / corr_src.name
+        copy_if_needed(corr_src, corr_dst, logger)
 
         # 3) MNS LiDAR HD via WFS (optionnel)
         if fetch_mns_lidar:

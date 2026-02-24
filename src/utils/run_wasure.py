@@ -2,11 +2,38 @@
 """
 Lancement de WaSuRe depuis le pipeline Python.
 
-Objectifs :
-- Ne JAMAIS réutiliser / effacer un dossier out_WASURE existant (problème de droits).
-- Créer un sous-dossier horodaté à chaque run.
-- Écrire les logs WaSuRe (très verbeux) dans un fichier dédié (pas dans le log principal).
-- Écrire un JSON "wasure_last_run.json" pour que la suite du pipeline retrouve la sortie.
+Ce module encapsule l'exécution de WaSuRe (via le script wrapper du dépôt) en respectant
+des contraintes pratiques rencontrées en environnement serveur (droits, traçabilité,
+verbeux des logs, etc.).
+
+Objectifs
+---------
+- Ne jamais réutiliser / effacer un dossier out_WASURE existant (risque de problèmes de droits).
+- Créer un sous-dossier horodaté à chaque exécution (un run = une sortie isolée).
+- Écrire les logs WaSuRe (très verbeux) dans un fichier dédié (séparé du log principal).
+- Écrire une métadonnée JSON par run et un JSON "last run" afin que les étapes suivantes
+  du pipeline puissent retrouver la dernière sortie produite.
+
+Sorties produites
+----------------
+Dans `out_wasure_root` :
+- `run_<timestamp>/` :
+    Dossier de sortie WaSuRe pour cette exécution.
+- `wasure_run_<timestamp>.json` :
+    Métadonnées (entrée, sortie, commande, log, returncode, durée) pour cette exécution.
+- `wasure_last_run.json` :
+    Copie des métadonnées du dernier run réussi/terminé (écrite même si échec, avec returncode).
+
+Dans `logs_dir` :
+- `wasure_<timestamp>.log` :
+    Log complet stdout+stderr de WaSuRe (très verbeux).
+
+Remarques
+---------
+- La commande est exécutée via `subprocess.run` avec `cwd` positionné sur le dépôt WaSuRe.
+- En cas d'échec (returncode != 0), une exception est levée et le log dédié doit être consulté.
+
+Auteur : ESaint-Denis
 """
 
 from __future__ import annotations
@@ -21,6 +48,26 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class WaSuReConfig:
+    """
+    Configuration d'exécution de WaSuRe.
+
+    Attributs
+    ---------
+    wasure_repo_dir : Path
+        Chemin du dépôt WaSuRe contenant le script wrapper (ex. run_lidarhd.sh).
+
+    wasure_script : str
+        Script à exécuter (chemin relatif à `wasure_repo_dir` ou commande accessible).
+        Exemple : "./run_lidarhd.sh".
+
+    extra_args : list[str] | None
+        Arguments supplémentaires optionnels, ajoutés tels quels à la commande.
+        Permet d'étendre les options WaSuRe sans modifier l'interface principale.
+
+    fail_if_input_empty : bool
+        Si True, le pipeline échoue si `input_dir` existe mais est vide.
+        Sert de garde-fou pour éviter de lancer WaSuRe sur une entrée invalide.
+    """
     # Dossier contenant run_lidarhd.sh
     wasure_repo_dir: Path = Path("/home/data_ssd/esaint-denis/sparkling-wasure")
     # Script à appeler (relatif à wasure_repo_dir)
@@ -32,10 +79,36 @@ class WaSuReConfig:
 
 
 def _timestamp() -> str:
+    """
+    Génère un identifiant horodaté lisible pour nommer un run.
+
+    Returns
+    -------
+    str
+        Timestamp au format "YYYY-mm-dd_HH-MM-SS".
+    """
     return time.strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def _dir_is_empty(p: Path) -> bool:
+    """
+    Indique si un répertoire est vide (ou illisible).
+
+    Notes
+    -----
+    En cas d'erreur (droits, répertoire inaccessible, etc.), la fonction renvoie True
+    par prudence (comportement "fail safe").
+
+    Parameters
+    ----------
+    p : Path
+        Répertoire à tester.
+
+    Returns
+    -------
+    bool
+        True si vide (ou si une exception survient), False sinon.
+    """
     try:
         return not any(p.iterdir())
     except Exception:
@@ -51,11 +124,39 @@ def run_wasure(
     cfg: WaSuReConfig,
 ) -> Path:
     """
-    Lance WaSuRe sur input_dir (nuages LAZ combinés) et écrit dans out_wasure_root/run_YYYY-mm-dd_HH-MM-SS.
+    Lance WaSuRe sur un répertoire d'entrée contenant des nuages LAZ combinés.
 
-    Retour
+    L'exécution crée systématiquement un sous-dossier de sortie unique :
+    `out_wasure_root/run_<timestamp>/`.
+
+    Les logs WaSuRe (stdout+stderr) sont redirigés vers un fichier dédié dans `logs_dir`
+    pour éviter de polluer le log principal du pipeline.
+
+    Parameters
+    ----------
+    input_dir : Path
+        Répertoire d'entrée contenant les nuages LAZ combinés (produits par l'étape de fusion).
+    out_wasure_root : Path
+        Répertoire racine des sorties WaSuRe.
+    logs_dir : Path
+        Répertoire des logs du pipeline (on y place un log dédié WaSuRe).
+    logger : logging.Logger
+        Logger du pipeline (log court et informatif).
+    cfg : WaSuReConfig
+        Configuration WaSuRe (dépôt, script, options, garde-fous).
+
+    Returns
+    -------
+    Path
+        Chemin du dossier de sortie WaSuRe pour ce run : `out_wasure_root/run_<timestamp>`.
+
+    Raises
     ------
-    Path : dossier de sortie WaSuRe de ce run
+    FileNotFoundError
+        Si `input_dir` n'existe pas.
+    RuntimeError
+        Si `input_dir` est vide (si `fail_if_input_empty=True`) ou si WaSuRe échoue
+        (returncode != 0).
     """
     input_dir = Path(input_dir)
     out_wasure_root = Path(out_wasure_root)
@@ -78,7 +179,7 @@ def run_wasure(
     meta_path = out_wasure_root / f"wasure_run_{run_id}.json"
     last_path = out_wasure_root / "wasure_last_run.json"
 
-    # Commande (appel du wrapper, docker ou pas: transparent)
+    # Commande (appel du wrapper, docker ou pas : transparent)
     cmd = [
         cfg.wasure_script,
         "--input_dir", str(input_dir),
@@ -87,7 +188,7 @@ def run_wasure(
     if cfg.extra_args:
         cmd.extend(cfg.extra_args)
 
-    # Log principal: court et utile
+    # Log principal : court et utile
     logger.info("==== Étape WaSuRe ====")
     logger.info("Repo WaSuRe: %s", cfg.wasure_repo_dir)
     logger.info("Commande: %s", " ".join(cmd))

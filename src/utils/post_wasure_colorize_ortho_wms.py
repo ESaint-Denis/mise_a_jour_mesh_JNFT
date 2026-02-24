@@ -1,18 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Step 8 - Colorize shifted WaSuRe PLY tiles with IGN orthophotos via WMS-R GetMap.
+Étape 8 - Colorisation des tuiles PLY WaSuRe (déjà shiftées en L93) avec les orthophotos IGN via WMS-R GetMap.
 
-Design:
-- For each PLY tile (in L93), compute its XY bbox (+ optional buffer).
-- Request a WMS GetMap image for that bbox at a target ground sampling distance (GSD).
-- Sample RGB at each vertex (nearest or bilinear).
-- Write a new PLY with per-vertex colors (red/green/blue uint8), keeping faces intact.
+Principe
+--------
+Pour chaque tuile PLY (coordonnées L93 / EPSG:2154) :
+- on calcule sa bbox XY (avec un buffer optionnel),
+- on requête une image WMS GetMap correspondant à cette bbox, à une résolution sol (GSD) cible,
+- on échantillonne la couleur RGB au niveau de chaque sommet (nearest ou bilinear),
+- on écrit un nouveau PLY avec des champs couleur par sommet (red/green/blue en uint8),
+  en conservant les autres éléments (faces, etc.) inchangés.
 
-All comments in English.
+Choix de conception
+------------------
+- Le mode par défaut est "nearest" : rapide, et cohérent avec les tests initiaux.
+- Un cache disque évite de re-télécharger les mêmes images WMS lors de relances.
 
-Notes:
-- Default mode uses nearest neighbor sampling (fast, matches your experimental script).
-- A disk cache avoids re-downloading WMS images on re-runs.
+Notes
+-----
+- Les champs ajoutés/écrasés sur les sommets sont : red, green, blue (uint8).
+- Les images WMS sont lues en mémoire (rasterio MemoryFile) pour éviter de gérer un format géoréférencé sur disque.
 """
 
 from __future__ import annotations
@@ -35,6 +42,8 @@ from plyfile import PlyData, PlyElement
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
 
+# On ignore cet avertissement : les images WMS (JPEG/PNG) ne sont pas forcément géoréférencées
+# au sens strict de rasterio, mais on reconstruit nous-même un transform à partir de la bbox demandée.
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 # ----------------------------- Configuration -----------------------------
@@ -42,38 +51,85 @@ warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 @dataclass(frozen=True)
 class OrthoWmsConfig:
-    # WMS-R endpoint (GeoPlateforme IGN)
+    """
+    Paramètres de colorisation par orthophoto via WMS.
+
+    Attributs
+    ---------
+    wms_url : str
+        URL du service WMS-R (GéoPlateforme IGN).
+    layer : str
+        Nom de couche WMS (par défaut : orthophotos).
+    crs : str
+        CRS de la requête WMS. Après l'étape 7, les PLY sont en EPSG:2154.
+    img_format : str
+        Format de sortie image demandé au WMS (ex. image/jpeg).
+    gsd_m : float
+        Résolution sol cible (Ground Sampling Distance) en mètres.
+    bbox_buffer_m : float
+        Marge ajoutée à la bbox XY (en mètres) pour éviter des artefacts de bord.
+    sampling : {"nearest","bilinear"}
+        Mode d'échantillonnage RGB au niveau des sommets.
+    default_rgb : tuple[int,int,int]
+        Couleur par défaut utilisée si un sommet tombe hors image (ou hors zone valide).
+    overwrite : bool
+        Si False, ne réécrit pas les PLY de sortie existants.
+    cache_dirname : str
+        Nom du dossier de cache (créé dans le répertoire du run WaSuRe).
+    sleep_s : float
+        Pause entre requêtes pour limiter la charge côté service.
+    timeout_s : float
+        Timeout réseau (requests).
+    retries : int
+        Nombre de tentatives en cas d'erreurs transitoires.
+    """
+    # URL WMS-R (GeoPlateforme IGN)
     wms_url: str = "https://data.geopf.fr/wms-r/wms"
-    # Layer name for BD ORTHO 20 cm
+    # Couche : BD ORTHO / orthophotos
     layer: str = "HR.ORTHOIMAGERY.ORTHOPHOTOS"
-    # CRS of the request (mesh is in EPSG:2154 after step 7)
+    # CRS de la requête (les tuiles mesh sont en EPSG:2154 après step 7)
     crs: str = "EPSG:2154"
-    # Output image format
+    # Format image de sortie
     img_format: str = "image/jpeg"
-    # Target ground sampling distance in meters (0.20 m by default)
+    # GSD cible en mètres (0.20 m par défaut)
     gsd_m: float = 0.20
-    # Extra margin around bbox (meters) to avoid border artifacts
+    # Marge autour de la bbox (mètres) pour éviter les artefacts en bordure
     bbox_buffer_m: float = 2.0
-    # Sampling mode
+    # Mode d'échantillonnage
     sampling: Literal["nearest", "bilinear"] = "nearest"
-    # Default color when outside image
+    # Couleur par défaut si hors image
     default_rgb: tuple[int, int, int] = (200, 200, 200)
-    # Overwrite output PLY if it already exists
+    # Réécrire les PLY de sortie s'ils existent déjà
     overwrite: bool = True
-    # Cache directory name (created inside run dir)
+    # Nom du dossier cache (créé dans le dossier du run)
     cache_dirname: str = "ortho_cache_wms"
-    # Request throttling (seconds) to be gentle with the service
+    # Limitation de débit : pause entre requêtes
     sleep_s: float = 0.05
-    # Network timeouts
+    # Timeout réseau
     timeout_s: float = 60.0
-    # Retry count for transient errors
+    # Nombre de retries en cas d'erreurs transitoires
     retries: int = 3
 
 
-# ----------------------------- Small helpers -----------------------------
+# ----------------------------- Petites fonctions utilitaires -----------------------------
 
 
 def _compute_bbox_xy(x: np.ndarray, y: np.ndarray, buffer_m: float) -> tuple[float, float, float, float]:
+    """
+    Calcule la bbox XY (xmin, ymin, xmax, ymax) à partir des coordonnées des sommets.
+
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Coordonnées des sommets.
+    buffer_m : float
+        Marge ajoutée (en m).
+
+    Returns
+    -------
+    tuple[float,float,float,float]
+        (xmin, ymin, xmax, ymax)
+    """
     xmin = float(np.nanmin(x)) - buffer_m
     xmax = float(np.nanmax(x)) + buffer_m
     ymin = float(np.nanmin(y)) - buffer_m
@@ -82,17 +138,43 @@ def _compute_bbox_xy(x: np.ndarray, y: np.ndarray, buffer_m: float) -> tuple[flo
 
 
 def _wms_image_size_for_bbox(bbox: tuple[float, float, float, float], gsd_m: float) -> tuple[int, int]:
+    """
+    Convertit une bbox métrique en dimensions pixel (width, height) à une GSD donnée.
+
+    On impose au minimum 2x2 pixels pour éviter des comportements indésirables
+    côté serveur ou côté lecture.
+
+    Parameters
+    ----------
+    bbox : tuple
+        (xmin, ymin, xmax, ymax)
+    gsd_m : float
+        Résolution sol (m/pixel).
+
+    Returns
+    -------
+    tuple[int,int]
+        (width_px, height_px)
+    """
     xmin, ymin, xmax, ymax = bbox
     w_m = max(0.0, xmax - xmin)
     h_m = max(0.0, ymax - ymin)
-    # Ensure at least 2x2 pixels to avoid server/client issues
     width = max(2, int(math.ceil(w_m / gsd_m)))
     height = max(2, int(math.ceil(h_m / gsd_m)))
     return width, height
 
 
 def _cache_key(cfg: OrthoWmsConfig, bbox: tuple[float, float, float, float], width: int, height: int) -> str:
-    # Stable key: parameters that affect pixel values
+    """
+    Produit une clé de cache stable à partir des paramètres impactant les valeurs pixels.
+
+    On inclut notamment : URL, layer, CRS, format, bbox, width/height.
+
+    Returns
+    -------
+    str
+        Hash court (24 caractères) utilisable comme nom de fichier.
+    """
     s = f"{cfg.wms_url}|{cfg.layer}|{cfg.crs}|{cfg.img_format}|{bbox}|{width}|{height}"
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:24]
 
@@ -107,7 +189,30 @@ def _download_wms_getmap(
     logger: logging.Logger,
 ) -> Path:
     """
-    Download a WMS GetMap image to out_path (with retries).
+    Télécharge une image WMS GetMap et l'écrit dans `out_path` (avec retries).
+
+    Parameters
+    ----------
+    cfg : OrthoWmsConfig
+        Configuration WMS.
+    bbox : tuple
+        (xmin, ymin, xmax, ymax) dans le CRS de la requête.
+    width, height : int
+        Dimensions pixel demandées.
+    out_path : Path
+        Chemin de sortie (fichier image).
+    logger : logging.Logger
+        Logger (non utilisé ici mais conservé pour cohérence d'interface).
+
+    Returns
+    -------
+    Path
+        Chemin vers l'image téléchargée.
+
+    Raises
+    ------
+    RuntimeError
+        Si la requête échoue après `cfg.retries` tentatives.
     """
     params = {
         "SERVICE": "WMS",
@@ -116,7 +221,7 @@ def _download_wms_getmap(
         "LAYERS": cfg.layer,
         "STYLES": "",
         "CRS": cfg.crs,
-        # For EPSG:2154, axis order is x,y (bbox = xmin,ymin,xmax,ymax)
+        # Pour EPSG:2154, l'ordre d'axes attendu ici est x,y => xmin,ymin,xmax,ymax
         "BBOX": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
         "WIDTH": str(width),
         "HEIGHT": str(height),
@@ -135,7 +240,7 @@ def _download_wms_getmap(
             return out_path
         except Exception as e:
             last_err = e
-            # Small backoff
+            # Petit backoff (progressif)
             time.sleep(0.5 * (k + 1))
 
     raise RuntimeError(f"WMS GetMap failed after {cfg.retries} retries: {last_err}") from last_err
@@ -143,12 +248,26 @@ def _download_wms_getmap(
 
 def _read_rgb_from_image_bytes(img_path: Path) -> np.ndarray:
     """
-    Read an RGB image (JPEG/PNG) into an HxWx3 uint8 array using rasterio.
+    Lit une image RGB (JPEG/PNG) et renvoie un tableau HxWx3 uint8 via rasterio.
+
+    Notes
+    -----
+    - Beaucoup de JPEG sont en 3 bandes (RGB).
+    - Certains flux peuvent avoir 4 bandes (RGBA) : on lit uniquement les 3 premières.
+
+    Parameters
+    ----------
+    img_path : Path
+        Chemin vers l'image téléchargée.
+
+    Returns
+    -------
+    np.ndarray
+        Tableau (H, W, 3) en uint8.
     """
     data = img_path.read_bytes()
     with MemoryFile(data) as mem:
         with mem.open() as ds:
-            # Many JPEG are 3-band (RGB). Some may be 4-band (RGBA).
             count = ds.count
             if count < 3:
                 raise RuntimeError(f"Expected at least 3 bands in WMS image, got {count} for {img_path}")
@@ -156,7 +275,7 @@ def _read_rgb_from_image_bytes(img_path: Path) -> np.ndarray:
             g = ds.read(2)
             b = ds.read(3)
 
-            # Ensure uint8 output
+            # Conversion robuste en uint8
             if r.dtype != np.uint8:
                 r = np.clip(r, 0, 255).astype(np.uint8)
                 g = np.clip(g, 0, 255).astype(np.uint8)
@@ -167,6 +286,16 @@ def _read_rgb_from_image_bytes(img_path: Path) -> np.ndarray:
 
 
 def _xy_to_rowcol(transform: rasterio.Affine, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Conversion (x,y) -> (row,col) en utilisant l'inverse de l'affine raster.
+
+    Ici, on arrondit au pixel le plus proche (rint) pour un échantillonnage "nearest".
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        (rows, cols) en int64.
+    """
     inv = ~transform
     colf = inv.a * x + inv.b * y + inv.c
     rowf = inv.d * x + inv.e * y + inv.f
@@ -176,6 +305,23 @@ def _xy_to_rowcol(transform: rasterio.Affine, x: np.ndarray, y: np.ndarray) -> t
 
 
 def _sample_rgb_nearest(rgb: np.ndarray, rows: np.ndarray, cols: np.ndarray, default_rgb: tuple[int, int, int]) -> np.ndarray:
+    """
+    Échantillonne RGB au plus proche voisin.
+
+    Parameters
+    ----------
+    rgb : np.ndarray
+        Image (H,W,3) uint8.
+    rows, cols : np.ndarray
+        Indices pixel.
+    default_rgb : tuple
+        Couleur par défaut si hors image.
+
+    Returns
+    -------
+    np.ndarray
+        Tableau (N,3) uint8.
+    """
     H, W, _ = rgb.shape
     out = np.empty((rows.size, 3), dtype=np.uint8)
 
@@ -189,6 +335,18 @@ def _sample_rgb_nearest(rgb: np.ndarray, rows: np.ndarray, cols: np.ndarray, def
 
 
 def _sample_rgb_bilinear(rgb: np.ndarray, transform: rasterio.Affine, x: np.ndarray, y: np.ndarray, default_rgb: tuple[int, int, int]) -> np.ndarray:
+    """
+    Échantillonnage bilinéaire en espace raster.
+
+    - On calcule les coordonnées flottantes (rowf, colf),
+    - on interpole entre les 4 pixels voisins,
+    - si un point sort des bornes, on laisse la couleur par défaut.
+
+    Returns
+    -------
+    np.ndarray
+        Tableau (N,3) uint8.
+    """
     # Bilinear in raster space
     inv = ~transform
     colf = inv.a * x + inv.b * y + inv.c
@@ -229,8 +387,20 @@ def _sample_rgb_bilinear(rgb: np.ndarray, transform: rasterio.Affine, x: np.ndar
 
 def _ensure_vertex_rgb_fields(vertex_arr: np.ndarray) -> np.ndarray:
     """
-    Ensure the structured vertex array contains uint8 fields red/green/blue.
-    If already present, keep them (will be overwritten).
+    Garantit que le tableau structuré des sommets contient les champs uint8 : red/green/blue.
+
+    - Si les champs existent déjà : on retourne le tableau tel quel (ils seront écrasés ensuite).
+    - Sinon : on crée un nouveau dtype en ajoutant ces champs, et on copie les données.
+
+    Parameters
+    ----------
+    vertex_arr : np.ndarray
+        Tableau structuré (vertex) issu du PLY.
+
+    Returns
+    -------
+    np.ndarray
+        Tableau structuré avec champs couleur présents.
     """
     names = vertex_arr.dtype.names or ()
     need = [("red", "u1"), ("green", "u1"), ("blue", "u1")]
@@ -248,7 +418,7 @@ def _ensure_vertex_rgb_fields(vertex_arr: np.ndarray) -> np.ndarray:
     return out
 
 
-# ----------------------------- Main step function -----------------------------
+# ----------------------------- Fonction principale de l'étape -----------------------------
 
 
 def run_post_wasure_colorize_ortho_wms(
@@ -258,24 +428,48 @@ def run_post_wasure_colorize_ortho_wms(
     cfg: OrthoWmsConfig,
 ) -> Path:
     """
-    Step 8: colorize each PLY tile from IGN ortho via WMS GetMap.
+    Étape 8 : colorise chaque tuile PLY à partir des orthophotos IGN via WMS GetMap.
 
-    Input
-    -----
-    ply_l93_dir : directory containing shifted PLY tiles (L93), typically run_*/ply_L93.
-
-    Output
+    Entrée
     ------
-    Directory run_*/ply_L93_ortho with colorized PLY tiles.
+    ply_l93_dir :
+        Répertoire contenant les tuiles PLY déjà shiftées en L93 (typiquement : `run_*/ply_L93`).
+
+    Sortie
+    ------
+    Un répertoire `run_*/ply_L93_ortho` contenant les tuiles PLY colorisées.
+
+    Détails
+    -------
+    - Pour chaque tuile : calcul bbox -> GetMap -> lecture RGB -> échantillonnage -> écriture PLY.
+    - Un cache d'images WMS est créé dans `run_*/<cfg.cache_dirname>`.
+
+    Parameters
+    ----------
+    ply_l93_dir : str | Path
+        Répertoire d'entrée des PLY (L93).
+    logger : logging.Logger
+        Logger du pipeline.
+    cfg : OrthoWmsConfig
+        Configuration WMS et paramètres d'échantillonnage.
+
+    Returns
+    -------
+    Path
+        Répertoire de sortie contenant les PLY colorisés.
     """
     ply_l93_dir = Path(ply_l93_dir)
     if not ply_l93_dir.is_dir():
         raise RuntimeError(f"Input directory not found: {ply_l93_dir}")
 
+    # On suppose que ply_l93_dir = <run_dir>/ply_L93 => run_dir = parent
     run_dir = ply_l93_dir.parent
+
+    # Sortie : PLY colorisés
     out_dir = run_dir / "ply_L93_ortho"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Cache des images GetMap
     cache_dir = run_dir / cfg.cache_dirname
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -298,23 +492,30 @@ def run_post_wasure_colorize_ortho_wms(
             n_skipped += 1
             continue
 
+        # Lecture du PLY
         ply = PlyData.read(str(in_ply))
         if "vertex" not in ply:
             logger.warning("No vertex element, skipping: %s", in_ply)
             continue
 
         v = np.array(ply["vertex"].data)
+
+        # Vérification des champs XY nécessaires au calcul bbox + sampling
         if "x" not in v.dtype.names or "y" not in v.dtype.names:
             raise RuntimeError(f"Missing x/y fields in vertex data: {in_ply}")
 
         x = v["x"].astype(np.float64)
         y = v["y"].astype(np.float64)
 
+        # Bbox de tuile + dimensions image à la GSD cible
         bbox = _compute_bbox_xy(x, y, cfg.bbox_buffer_m)
         width, height = _wms_image_size_for_bbox(bbox, cfg.gsd_m)
+
+        # Cache key déterministe
         key = _cache_key(cfg, bbox, width, height)
         img_path = cache_dir / f"{key}.jpg"
 
+        # Récupération image WMS (cache hit si déjà présent)
         if img_path.is_file():
             n_cached += 1
         else:
@@ -322,30 +523,34 @@ def run_post_wasure_colorize_ortho_wms(
             if cfg.sleep_s > 0:
                 time.sleep(cfg.sleep_s)
 
+        # Lecture image RGB
         rgb = _read_rgb_from_image_bytes(img_path)
 
-        # Build an affine transform consistent with the requested bbox and image size
+        # Construction d'un transform affine cohérent avec la bbox demandée et la taille image renvoyée
         transform = from_bounds(bbox[0], bbox[1], bbox[2], bbox[3], width=rgb.shape[1], height=rgb.shape[0])
 
+        # Échantillonnage des couleurs
         if cfg.sampling == "nearest":
             rows, cols = _xy_to_rowcol(transform, x, y)
             sampled = _sample_rgb_nearest(rgb, rows, cols, cfg.default_rgb)
         else:
             sampled = _sample_rgb_bilinear(rgb, transform, x, y, cfg.default_rgb)
 
+        # Ajout/garantie des champs couleurs et écriture dans v2
         v2 = _ensure_vertex_rgb_fields(v)
         v2["red"] = sampled[:, 0]
         v2["green"] = sampled[:, 1]
         v2["blue"] = sampled[:, 2]
 
-        # Replace vertex element, keep all other elements (faces, etc.)
+        # Remplacement de l'élément vertex, conservation des autres éléments (faces, etc.)
         new_elems = [PlyElement.describe(v2, "vertex")] + [e for e in ply.elements if e.name != "vertex"]
         ply.elements = tuple(new_elems)
 
+        # Écriture du PLY colorisé
         ply.write(str(out_ply))
         n_written += 1
 
-        # Keep main log light: progress every 50 tiles
+        # On garde le log principal léger : message de progression toutes les 50 tuiles
         if (i % 50) == 0:
             logger.info("Step 8 progress: %d/%d", i, len(ply_files))
 

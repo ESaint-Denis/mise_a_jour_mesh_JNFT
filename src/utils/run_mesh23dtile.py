@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Run WaSuRe mesh23dtile LOD/3D Tiles generator.
+Exécution du générateur LOD / 3D Tiles "mesh23dtile" de WaSuRe.
 
-This wraps:
+Ce module encapsule l'appel :
   <wasure_repo>/services/mesh23dtile/run.sh
 
-Two execution modes:
-- Docker mode (recommended): runs inside WaSuRe docker image where conda env + obj-tiler exist.
-- Host mode: runs run.sh directly on the host (requires conda + deps available on host).
+Deux modes d'exécution
+---------------------
+- Mode Docker (recommandé) :
+    Exécute run.sh dans l'image Docker WaSuRe contenant l'environnement conda + obj-tiler.
+- Mode Host :
+    Exécute run.sh directement sur la machine hôte (nécessite conda + dépendances présentes sur l'hôte).
 
-Notes:
-- WaSuRe mesh23dtile expects INPUT PLY tiles in LOCAL coordinates (like outputs/tiles),
-  and uses wasure_metadata_3d_gen.xml to apply offsets / CRS conversion to EPSG:4978.
-- Keep logs separate from main pipeline log.
+Notes importantes
+-----------------
+- Le service WaSuRe mesh23dtile attend des tuiles PLY en coordonnées LOCALES (type outputs/tiles).
+  Il utilise le fichier wasure_metadata_3d_gen.xml (dans le run_*) pour appliquer les offsets
+  et convertir vers EPSG:4978 lors de la génération des 3D Tiles.
+- Les logs de cette étape sont séparés du log principal du pipeline (fichier dédié).
+- La sortie attendue est typiquement un tileset.json dans le répertoire de sortie.
 
-All code comments in English.
+Tous les commentaires de code sont en français.
 """
 
 from __future__ import annotations
@@ -29,63 +35,97 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# ----------------------------- Config -----------------------------
+# ----------------------------- Configuration -----------------------------
 
 
 @dataclass(frozen=True)
 class Mesh23DTileConfig:
-    # Path to sparkling-wasure repository on the HOST filesystem.
+    """
+    Configuration pour l'exécution de WaSuRe mesh23dtile.
+
+    Attributs
+    ---------
+    wasure_repo_dir : Path
+        Chemin vers le dépôt sparkling-wasure sur le système de fichiers HÔTE.
+        Il doit contenir services/mesh23dtile/run.sh.
+    num_process : int
+        Nombre maximal de jobs parallèles utilisés par run.sh (variable d'environnement NUM_PROCESS).
+    overwrite : bool
+        Si False et qu'un tileset.json existe déjà dans output_dir, l'exécution est ignorée.
+    exec_mode : str
+        Backend d'exécution : "docker" (recommandé) ou "host".
+    docker_image : str
+        Nom de l'image Docker contenant l'environnement WaSuRe (conda env mesh23Dtile, obj-tiler, etc.).
+    docker_user : bool
+        Si True, exécute le conteneur avec l'UID/GID courant pour éviter de produire des fichiers root.
+    docker_extra_args : tuple[str, ...]
+        Arguments supplémentaires passés à `docker run` (ex: "--network=host").
+    extra_env : tuple[tuple[str, str], ...]
+        Variables d'environnement additionnelles à passer au conteneur (en plus de NUM_PROCESS).
+    """
+    # Chemin vers le dépôt sparkling-wasure sur l'HÔTE.
     wasure_repo_dir: Path
 
-    # Max parallel jobs used by run.sh for obj-tiler (NUM_PROCESS env var).
+    # Nombre de processus parallèles (variable NUM_PROCESS consommée par run.sh).
     num_process: int = 30
 
-    # If False and output already has a tileset.json, skip running.
+    # Si False et la sortie contient déjà tileset.json, on skip.
     overwrite: bool = True
 
-    # Execution backend: "docker" (recommended) or "host".
+    # Mode d'exécution : "docker" (recommandé) ou "host".
     exec_mode: str = "docker"
 
-    # Docker image that contains the WaSuRe environment (conda env mesh23Dtile, obj-tiler, etc.)
+    # Image Docker contenant l'environnement WaSuRe (conda env mesh23Dtile, obj-tiler, etc.).
     docker_image: str = "ddt_img_base_devel_proxy"
 
-    # If True, run container as current user (helps avoid root-owned outputs).
+    # Si True, exécute le conteneur en tant qu'utilisateur courant (évite les sorties appartenant à root).
     docker_user: bool = True
 
-    # Extra docker args (e.g., ["--network=host"] if needed).
+    # Arguments docker supplémentaires (ex: ["--network=host"]).
     docker_extra_args: tuple[str, ...] = ()
 
-    # Extra env vars to pass to docker container (in addition to NUM_PROCESS).
+    # Variables d'environnement supplémentaires (en plus de NUM_PROCESS).
     extra_env: tuple[tuple[str, str], ...] = ()
 
 
 def _timestamp() -> str:
+    """Horodatage lisible (utilisé pour nommer logs et métadonnées)."""
     return time.strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def _ensure_dir(p: Path) -> None:
+    """Crée un répertoire s'il n'existe pas (parents inclus)."""
     p.mkdir(parents=True, exist_ok=True)
 
 
 def _has_tileset(output_dir: Path) -> bool:
-    # WaSuRe finalize.py typically produces tileset.json at output root
-    # and tiles/ with intermediate objs.
+    """
+    Détecte la présence d'une sortie mesh23dtile déjà produite.
+
+    WaSuRe finalize.py génère généralement tileset.json à la racine du dossier de sortie.
+    """
     return (output_dir / "tileset.json").is_file()
 
 
 def _check_prereqs_host(logger: logging.Logger) -> None:
-    # Host mode needs docker? no. Needs bash? yes. Needs run.sh internal conda path (/opt/conda) -> usually absent.
-    # We keep it, but warn clearly.
+    """
+    Vérifie les prérequis minimaux en mode 'host'.
+
+    Le mode host est en général fragile car run.sh peut sourcer /opt/conda/etc/profile.d/conda.sh
+    et s'attend à trouver l'environnement conda mesh23Dtile + obj-tiler. On conserve ce mode,
+    mais on prévient clairement dans les logs.
+    """
     if shutil.which("bash") is None:
-        raise RuntimeError("[mesh23dtile] 'bash' not found in PATH (required for host exec_mode).")
+        raise RuntimeError("[mesh23dtile] 'bash' introuvable dans PATH (requis pour exec_mode='host').")
     logger.warning(
-        "[mesh23dtile] exec_mode='host' selected. This is usually fragile because WaSuRe run.sh "
-        "sources /opt/conda/etc/profile.d/conda.sh and expects env mesh23Dtile + obj-tiler. "
-        "Prefer exec_mode='docker'."
+        "[mesh23dtile] exec_mode='host' sélectionné. Ce mode est souvent fragile car WaSuRe run.sh "
+        "source /opt/conda/etc/profile.d/conda.sh et s'attend à l'env mesh23Dtile + obj-tiler. "
+        "Préférer exec_mode='docker'."
     )
 
 
 def _docker_available() -> bool:
+    """Retourne True si la commande `docker` est disponible dans PATH."""
     return shutil.which("docker") is not None
 
 
@@ -97,6 +137,27 @@ def _run_subprocess_to_log(
     log_file: Path,
     header_lines: list[str],
 ) -> subprocess.CompletedProcess:
+    """
+    Exécute une commande et redirige stdout+stderr vers un fichier log.
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Commande complète à exécuter.
+    cwd : Path | None
+        Répertoire de travail pour le subprocess (None => ne pas forcer).
+    env : dict[str,str] | None
+        Environnement à passer au subprocess (None => héritage).
+    log_file : Path
+        Fichier de log de sortie.
+    header_lines : list[str]
+        Lignes préfixées au début du log (traçabilité : run_id, cmd, chemins...).
+
+    Returns
+    -------
+    subprocess.CompletedProcess
+        Résultat de l'exécution (returncode, etc.).
+    """
     with open(log_file, "w", encoding="utf-8") as f:
         for line in header_lines:
             f.write(line.rstrip("\n") + "\n")
@@ -120,46 +181,49 @@ def _build_docker_cmd(
     output_dir: Path,
 ) -> list[str]:
     """
-    Build a docker command that runs the WaSuRe mesh23dtile run.sh INSIDE the container.
-    We mount:
-      - wasure repo (so we can call services/mesh23dtile/run.sh)
-      - input_dir, output_dir, and xml file paths (they live in /media/... so mount root /media)
-    The simplest robust mount is to mount '/' read-write - but that’s usually not allowed/polite.
-    Instead we mount the common prefixes: /media and the repo path.
+    Construit une commande `docker run` qui exécute mesh23dtile/run.sh DANS le conteneur.
+
+    Stratégie de montage (volumes)
+    ------------------------------
+    On monte :
+    - /media -> /media, si input/output/xml sont sous /media/... (cas typique /media/DATA/...)
+    - le dépôt WaSuRe (host_wasure_repo_dir) pour accéder à services/mesh23dtile/run.sh
+    - /tmp -> /tmp pour les fichiers temporaires (certains outils le supposent)
+
+    Note
+    ----
+    Monter '/' en entier serait robuste mais généralement interdit / déconseillé.
+    Ici on se limite à des préfixes usuels (/media, repo, /tmp).
     """
     if not _docker_available():
-        raise RuntimeError("[mesh23dtile] docker not found in PATH but exec_mode='docker'.")
+        raise RuntimeError("[mesh23dtile] docker introuvable dans PATH alors que exec_mode='docker'.")
 
-    # Mount strategy:
-    # - mount /media (your data paths are /media/DATA/...)
-    # - mount repo directory
     mounts: list[str] = []
 
-    # Mount /media if relevant
+    # Monter /media si les chemins de données sont sous /media
     if str(input_dir).startswith("/media/") or str(output_dir).startswith("/media/") or str(xml_file).startswith("/media/"):
         mounts += ["-v", "/media:/media"]
 
-    # Mount /home/data_ssd if relevant (your repo is there)
-    # We mount the repo dir explicitly.
+    # Monter le repo WaSuRe (monté à l'identique du chemin hôte)
     mounts += ["-v", f"{host_wasure_repo_dir}:{host_wasure_repo_dir}"]
 
-    # Also mount /tmp for temporary files (some tools assume it)
+    # Monter /tmp (souvent utile)
     mounts += ["-v", "/tmp:/tmp"]
 
-    # User mapping to avoid root-owned outputs
+    # Mapper l'utilisateur courant pour éviter de créer des sorties appartenant à root
     user_args: list[str] = []
     if cfg.docker_user:
         user_args = ["--user", f"{os.getuid()}:{os.getgid()}"]
 
-    # Environment variables
+    # Variables d'environnement passées au conteneur
     env_args: list[str] = ["-e", f"NUM_PROCESS={int(cfg.num_process)}"]
     for k, v in cfg.extra_env:
         env_args += ["-e", f"{k}={v}"]
 
-    # Working directory inside container: repo root (host path is mounted same path)
+    # Répertoire de travail dans le conteneur : racine du repo (même chemin que sur l'hôte)
     workdir_args = ["-w", str(host_wasure_repo_dir)]
 
-    # Command to run inside container
+    # Script à exécuter dans le conteneur
     script_in_container = host_wasure_repo_dir / "services" / "mesh23dtile" / "run.sh"
     inner_cmd = [
         "bash",
@@ -182,7 +246,7 @@ def _build_docker_cmd(
     return cmd
 
 
-# ----------------------------- Public API -----------------------------
+# ----------------------------- API publique -----------------------------
 
 
 def run_mesh23dtile(
@@ -196,19 +260,29 @@ def run_mesh23dtile(
     tag: str,
 ) -> Path:
     """
-    Run WaSuRe mesh23dtile on a directory of PLY tiles.
+    Lance WaSuRe mesh23dtile sur un dossier de tuiles PLY.
 
     Parameters
     ----------
-    input_dir : directory with PLY tiles (expected local coords, WaSuRe-style).
-    wasure_run_dir : run_* directory containing wasure_metadata_3d_gen.xml
-    output_dir : destination directory for tileset (will be created)
-    logs_dir : directory for logs
-    tag : used to name the log/json (e.g. "ortho" or "origin")
+    input_dir
+        Dossier contenant des tuiles PLY (coordonnées locales, style WaSuRe outputs/tiles).
+    wasure_run_dir
+        Dossier run_* contenant le fichier wasure_metadata_3d_gen.xml (métadonnées + offset).
+    output_dir
+        Dossier de sortie du tileset (créé si besoin).
+    logs_dir
+        Dossier pour les logs de cette étape (fichier dédié).
+    logger
+        Logger du pipeline (log principal). Cette fonction écrit un log séparé pour mesh23dtile.
+    cfg
+        Configuration Mesh23DTileConfig.
+    tag
+        Chaîne utilisée pour nommer les logs/JSON (ex : "ortho" ou "origin").
 
     Returns
     -------
-    Path : output_dir
+    Path
+        Le dossier output_dir (doit contenir tileset.json en cas de succès).
     """
     input_dir = Path(input_dir)
     wasure_run_dir = Path(wasure_run_dir)
@@ -216,28 +290,30 @@ def run_mesh23dtile(
     logs_dir = Path(logs_dir)
 
     if not input_dir.is_dir():
-        raise FileNotFoundError(f"[mesh23dtile] input_dir not found: {input_dir}")
+        raise FileNotFoundError(f"[mesh23dtile] input_dir introuvable: {input_dir}")
 
-    # Ensure input contains some .ply
+    # Vérifier qu'il y a au moins une tuile .ply
     n_ply = len(list(input_dir.glob("*.ply")))
     if n_ply == 0:
-        raise RuntimeError(f"[mesh23dtile] input_dir has no .ply tiles: {input_dir}")
+        raise RuntimeError(f"[mesh23dtile] input_dir ne contient aucune tuile .ply: {input_dir}")
 
+    # Métadonnées WaSuRe nécessaires (offset/CRS, etc.)
     xml_file = wasure_run_dir / "wasure_metadata_3d_gen.xml"
     if not xml_file.is_file():
-        raise FileNotFoundError(f"[mesh23dtile] missing XML: {xml_file}")
+        raise FileNotFoundError(f"[mesh23dtile] XML manquant: {xml_file}")
 
+    # Script mesh23dtile
     script = cfg.wasure_repo_dir / "services" / "mesh23dtile" / "run.sh"
     if not script.is_file():
-        raise FileNotFoundError(f"[mesh23dtile] missing script: {script}")
+        raise FileNotFoundError(f"[mesh23dtile] script manquant: {script}")
 
     _ensure_dir(output_dir)
     _ensure_dir(logs_dir)
 
-    # Overwrite policy
+    # Politique overwrite : si tileset.json existe déjà et overwrite=False, on skip
     if _has_tileset(output_dir) and not cfg.overwrite:
         logger.info("==== Step 11 - mesh23dtile (%s) ====", tag)
-        logger.info("Output already exists and overwrite=False -> skipping: %s", output_dir / "tileset.json")
+        logger.info("La sortie existe déjà et overwrite=False -> skip: %s", output_dir / "tileset.json")
         return output_dir
 
     run_id = _timestamp()
@@ -245,7 +321,7 @@ def run_mesh23dtile(
     meta_file = output_dir / f"mesh23dtile_{tag}_{run_id}.json"
     last_file = output_dir / f"mesh23dtile_{tag}_last.json"
 
-    # Build command
+    # Construction de la commande selon le mode d'exécution
     if cfg.exec_mode.lower() == "docker":
         cmd = _build_docker_cmd(
             cfg=cfg,
@@ -254,8 +330,8 @@ def run_mesh23dtile(
             xml_file=xml_file,
             output_dir=output_dir,
         )
-        cwd = None  # docker uses -w
-        env = None  # passed via -e
+        cwd = None  # docker gère -w
+        env = None  # docker gère -e
     elif cfg.exec_mode.lower() == "host":
         _check_prereqs_host(logger)
         cmd = [
@@ -270,20 +346,23 @@ def run_mesh23dtile(
         for k, v in cfg.extra_env:
             env[k] = v
     else:
-        raise ValueError(f"[mesh23dtile] Unknown exec_mode: {cfg.exec_mode!r} (expected 'docker' or 'host').")
+        raise ValueError(f"[mesh23dtile] exec_mode inconnu: {cfg.exec_mode!r} (attendu: 'docker' ou 'host').")
 
+    # Logs principaux (résumés)
     logger.info("==== Step 11 - mesh23dtile (%s) ====", tag)
-    logger.info("Input tiles dir: %s (ply=%d)", input_dir, n_ply)
+    logger.info("Dossier PLY entrée: %s (ply=%d)", input_dir, n_ply)
     logger.info("XML: %s", xml_file)
-    logger.info("Output tileset dir: %s", output_dir)
-    logger.info("Log (separate): %s", log_file)
+    logger.info("Dossier sortie tileset: %s", output_dir)
+    logger.info("Log (séparé): %s", log_file)
     logger.info("NUM_PROCESS=%d", int(cfg.num_process))
-    logger.info("Exec mode: %s", cfg.exec_mode)
+    logger.info("Mode exécution: %s", cfg.exec_mode)
     if cfg.exec_mode.lower() == "docker":
-        logger.info("Docker image: %s", cfg.docker_image)
-    logger.info("Command: %s", " ".join(cmd))
+        logger.info("Image Docker: %s", cfg.docker_image)
+    logger.info("Commande: %s", " ".join(cmd))
 
     start_t = time.time()
+
+    # Entête écrit dans le log séparé (traçabilité reproductible)
     header = [
         f"[PIPELINE] mesh23dtile tag={tag} run_id={run_id}",
         f"[PIPELINE] exec_mode={cfg.exec_mode}",
@@ -297,6 +376,7 @@ def run_mesh23dtile(
     proc = _run_subprocess_to_log(cmd=cmd, cwd=cwd, env=env, log_file=log_file, header_lines=header)
     elapsed_s = time.time() - start_t
 
+    # Métadonnées JSON (écrit même en cas d'échec)
     meta = {
         "tag": tag,
         "run_id": run_id,
@@ -317,25 +397,25 @@ def run_mesh23dtile(
     meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     last_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    # Gestion des erreurs d'exécution
     if proc.returncode != 0:
-        logger.error("mesh23dtile failed (returncode=%d). See: %s", proc.returncode, log_file)
-        raise RuntimeError(f"mesh23dtile failed (returncode={proc.returncode}). Log: {log_file}")
+        logger.error("mesh23dtile a échoué (returncode=%d). Voir: %s", proc.returncode, log_file)
+        raise RuntimeError(f"mesh23dtile a échoué (returncode={proc.returncode}). Log: {log_file}")
 
-    # Post-check: ensure tileset exists
+    # Post-check : tileset.json doit exister
     tileset = output_dir / "tileset.json"
     if not tileset.is_file():
-        # Very common symptom when run.sh silently fails or finalize.py wasn't reached.
-        logger.error("mesh23dtile returned 0 but tileset.json is missing: %s", tileset)
-        logger.error("See log: %s", log_file)
-        raise RuntimeError(f"mesh23dtile produced no tileset.json. Log: {log_file}")
+        # Symptôme courant si run.sh échoue sans propager correctement l'erreur
+        logger.error("mesh23dtile a retourné 0 mais tileset.json est manquant: %s", tileset)
+        logger.error("Voir log: %s", log_file)
+        raise RuntimeError(f"mesh23dtile n'a pas produit tileset.json. Log: {log_file}")
 
-    # Basic sanity: avoid the "only 2 json files" situation
-    # (tileset.json should exist; usually 'tiles/' also exists, plus intermediate objs/plys).
+    # Sanity check : selon versions, le dossier tiles/ peut ou non être présent
     has_tiles_dir = (output_dir / "tiles").is_dir()
     if not has_tiles_dir:
         logger.warning(
-            "mesh23dtile produced tileset.json but no 'tiles/' directory found in %s. "
-            "This can happen depending on WaSuRe version/finalize. Check the log: %s",
+            "mesh23dtile a produit tileset.json mais aucun dossier 'tiles/' n'a été trouvé dans %s. "
+            "Cela peut dépendre de la version WaSuRe/finalize. Vérifier le log: %s",
             output_dir, log_file
         )
 

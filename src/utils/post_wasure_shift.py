@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Post-processing step after WaSuRe: translate PLY tiles (shift or unshift).
+Post-traitement après WaSuRe : translation des tuiles PLY (shift / unshift).
 
-This module:
-- reads the shift from wasure_metadata_3d_gen.xml (<bbox_ori>),
-- applies it (+shift or -shift) to all PLY tiles (ASCII or binary),
-- writes translated PLY files into <wasure_run_dir>/<out_subdir>.
+Ce module :
+- lit le décalage (Xmin, Ymin, Zmin) dans `wasure_metadata_3d_gen.xml` (balise `<bbox_ori>`),
+- applique une translation (+shift ou -shift) à toutes les tuiles PLY (ASCII ou binaire),
+- écrit les PLY translatés dans `<wasure_run_dir>/<out_subdir>`.
 
-Notes:
-- This only updates vertex coordinates (and optional extra coordinate fields).
-- It does NOT update any custom header comments such as "comment bbox ...".
-  This is intentional: for WaSuRe mesh23dtile, keeping local "comment bbox" untouched
-  is usually desirable when working with local-coordinate PLY tiles.
+Notes importantes
+-----------------
+- Seules les coordonnées des sommets (vertex) sont mises à jour (et éventuellement des champs
+  supplémentaires si demandés via `t_coords`).
+- Les commentaires personnalisés de l'en-tête PLY (ex. "comment bbox ...") ne sont pas recalculés.
+  C'est intentionnel : pour WaSuRe / mesh23dtile, conserver certains commentaires "locaux"
+  inchangés est généralement souhaitable lorsque l'on travaille avec des tuiles PLY en coordonnées locales.
+- Une correction de compatibilité est appliquée après écriture : s'assurer que la ligne
+  `comment bbox ...` se termine par un espace avant le retour à la ligne (requis par certains parseurs).
 
-All code comments are in English.
 """
 
 from __future__ import annotations
@@ -35,14 +38,29 @@ from plyfile import PlyData, PlyElement, PlyElementParseError
 
 def get_shift_from_xml(xml_file: str | Path) -> list[float]:
     """
-    Extract the shift (Xmin, Ymin, Zmin) from the <bbox_ori> tag of an XML file.
+    Extrait le shift (Xmin, Ymin, Zmin) depuis la balise `<bbox_ori>` d'un fichier XML WaSuRe.
 
-    Notes
-    -----
-    The <bbox_ori> tag is expected to contain a string of the form:
+    Le contenu de `<bbox_ori>` est attendu sous la forme :
     'xminxXmax:yminxYmax:zminxZmax'
-    Example:
+
+    Exemple
+    -------
     '916000.0x917000.0:6457000.0x6458000.0:118.93x10000.0'
+
+    Parameters
+    ----------
+    xml_file : str | Path
+        Chemin vers le fichier XML (ex. `wasure_metadata_3d_gen.xml`).
+
+    Returns
+    -------
+    list[float]
+        [xmin, ymin, zmin] extraits de `<bbox_ori>`.
+
+    Raises
+    ------
+    RuntimeError
+        Si la balise `<bbox_ori>` est absente ou vide.
     """
     xml_file = str(xml_file)
     tree = ET.parse(xml_file)
@@ -61,15 +79,20 @@ def get_shift_from_xml(xml_file: str | Path) -> list[float]:
 # ----------------------------- PLY helpers -----------------------------
 def fix_bbox_comment_trailing_space(ply_path: str | Path) -> bool:
     """
-    Ensure the header line 'comment bbox ...' ends with a trailing space before newline.
+    Assure que la ligne d'en-tête `comment bbox ...` se termine par un espace avant le retour à la ligne.
 
-    This is required for WaSuRe mesh23dtile.py which parses the bbox line with
-    a split logic that expects an extra trailing separator token.
+    Cette correction est requise pour certains outils WaSuRe (ex. mesh23dtile.py) dont le parseur
+    de la ligne bbox attend un séparateur final.
+
+    Parameters
+    ----------
+    ply_path : str | Path
+        Chemin vers le fichier PLY à corriger.
 
     Returns
     -------
     bool
-        True if the file was modified, False otherwise.
+        True si le fichier a été modifié, False sinon.
     """
     ply_path = Path(ply_path)
 
@@ -114,7 +137,20 @@ def fix_bbox_comment_trailing_space(ply_path: str | Path) -> bool:
 
 def reformat_ply_ascii_flat(in_path: str | Path, out_path: str | Path) -> None:
     """
-    Convert a flattened ASCII PLY into a standard one (one vertex/face per line).
+    Convertit un PLY ASCII "aplati" (tokens sans retours ligne attendus) en PLY ASCII standard.
+
+    Certains PLY ASCII peuvent être écrits en une forme où les sommets/faces ne sont pas
+    correctement séparés par ligne, ce qui déclenche des erreurs de parsing.
+    Cette fonction reconstruit un format standard :
+    - un sommet par ligne,
+    - une face par ligne.
+
+    Parameters
+    ----------
+    in_path : str | Path
+        PLY ASCII d'entrée (potentiellement aplati).
+    out_path : str | Path
+        PLY ASCII de sortie (reformaté).
     """
     in_path = str(in_path)
     out_path = str(out_path)
@@ -171,7 +207,20 @@ def reformat_ply_ascii_flat(in_path: str | Path, out_path: str | Path) -> None:
 
 def upgrade_vertex_dtype_to_double(vertex_arr: np.ndarray) -> np.ndarray:
     """
-    Convert all float32 fields of a structured vertex array to float64.
+    Convertit tous les champs float32 d'un tableau structuré de sommets en float64.
+
+    Objectif : éviter les pertes de précision lors de l'application d'un shift
+    sur des coordonnées (notamment quand les valeurs sont grandes).
+
+    Parameters
+    ----------
+    vertex_arr : np.ndarray
+        Tableau structuré (vertex) issu d'un PLY.
+
+    Returns
+    -------
+    np.ndarray
+        Nouveau tableau structuré avec les champs float32 convertis en float64.
     """
     new_descr = []
     for name, dtype in vertex_arr.dtype.descr:
@@ -197,23 +246,50 @@ def apply_shift_to_ply(
     logger: logging.Logger | None = None,
 ) -> bool:
     """
-    Apply a translation shift to selected vertex properties in a PLY file.
+    Applique une translation à certaines propriétés "vertex" d'un fichier PLY.
+
+    Le shift peut être fourni :
+    - directement via `shift=(dx,dy,dz)`,
+    - ou lu depuis un XML WaSuRe via `xml_path` (balise `<bbox_ori>`), ce qui écrase `shift`.
+
+    En l'absence de `xml_path`, une tentative de lecture est faite dans les commentaires PLY
+    si un commentaire commence par "IGN offset Pos" (fallback).
+
+    Le module supporte :
+    - PLY binaire / ASCII standard,
+    - et une réparation automatique de certains PLY ASCII "aplatis" (tokens sans fins de lignes),
+      qui provoquent une erreur de parsing (`PlyElementParseError`).
 
     Parameters
     ----------
-    shift
-        Translation (dx, dy, dz) to apply.
-    t_coords
-        Vertex properties to translate (default: x,y,z). If extra fields exist,
-        you may include them (e.g., x0,y0,z0 or x_origin,y_origin,z_origin).
-    xml_path
-        If provided, shift is read from the XML (<bbox_ori>) and overrides `shift`.
-        Note: In the orchestrator we typically read XML once and pass shift directly.
+    input_ply : str | Path
+        Chemin vers le PLY source.
+    output_ply : str | Path
+        Chemin du PLY de sortie.
+    shift : tuple[float, float, float]
+        Translation (dx, dy, dz) à appliquer si `xml_path` n'est pas fourni.
+    t_coords : tuple[str, ...]
+        Noms des propriétés vertex à translater (par défaut : ("x","y","z")).
+        Peut inclure d'autres champs s'ils existent, par ex. ("x0","y0","z0").
+        La translation est appliquée cycliquement sur (dx,dy,dz) via i % 3.
+    ascii_out : bool
+        Si True, force une écriture ASCII (plydata.text = True). Sinon conserve/écrit en binaire.
+    xml_path : str | Path | None
+        Si fourni, lit le shift depuis le XML (<bbox_ori>) et écrase `shift`.
+        Dans l'orchestrateur, on préfère lire le XML une seule fois et passer `shift` directement.
+    logger : logging.Logger | None
+        Logger optionnel (messages debug/warning).
 
     Returns
     -------
     bool
-        True if the input was detected as "flattened ASCII" and had to be repaired.
+        True si le PLY d'entrée a été détecté comme "ASCII aplati" et réparé temporairement,
+        False sinon.
+
+    Raises
+    ------
+    PlyElementParseError
+        Si le PLY est invalide et ne correspond pas au cas "ASCII aplati" géré.
     """
     input_ply = str(input_ply)
     output_ply = str(output_ply)
@@ -288,6 +364,24 @@ def apply_shift_to_ply(
 
 @dataclass(frozen=True)
 class PostWasureShiftConfig:
+    """
+    Configuration du post-traitement de translation des tuiles PLY.
+
+    Attributs
+    ---------
+    t_coords : tuple[str, ...]
+        Propriétés vertex à translater (par défaut : x,y,z).
+    ascii_out : bool
+        Si True, écrit les PLY en ASCII.
+    overwrite : bool
+        Si False, ne réécrit pas les PLY de sortie existants.
+    sign : int
+        Signe appliqué au shift lu dans le XML :
+        +1 => shift (coordonnées locales -> coordonnées globales),
+        -1 => unshift (coordonnées globales -> coordonnées locales).
+    out_subdir : str
+        Nom du sous-dossier de sortie (créé sous `wasure_out_dir`).
+    """
     t_coords: tuple[str, ...] = ("x", "y", "z")
     ascii_out: bool = False
     overwrite: bool = True
@@ -301,7 +395,25 @@ class PostWasureShiftConfig:
 
 def _find_tiles_dir(wasure_out_dir: Path) -> Path:
     """
-    Try common WaSuRe layouts and return the directory containing *.ply tiles.
+    Recherche un répertoire contenant des tuiles `.ply` selon des layouts WaSuRe courants.
+
+    Candidates testés (ordre) :
+    - <run>/outputs/tiles
+
+    Parameters
+    ----------
+    wasure_out_dir : Path
+        Répertoire d'un run WaSuRe (`run_*`).
+
+    Returns
+    -------
+    Path
+        Répertoire contenant les `.ply`.
+
+    Raises
+    ------
+    RuntimeError
+        Si aucun répertoire candidat ne contient de `.ply`.
     """
     candidates = [
         wasure_out_dir / "outputs" / "tiles",
@@ -322,24 +434,39 @@ def run_post_wasure_shift(
     tiles_dir: str | Path | None = None,
 ) -> Path:
     """
-    Translate all PLY tiles.
+    Translate toutes les tuiles PLY d'un run WaSuRe (shift ou unshift).
 
-    Parameters
+    Le shift est lu une seule fois depuis :
+    - `<wasure_out_dir>/wasure_metadata_3d_gen.xml` (balise `<bbox_ori>`),
+    puis multiplié par `cfg.sign` :
+    - +1 : shift (local -> global)
+    - -1 : unshift (global -> local)
+
+    Paramètres
     ----------
-    wasure_out_dir
-        WaSuRe run directory (run_*).
-    tiles_dir
-        Optional input tiles directory. If None, defaults to <run_*/outputs/tiles>.
-        Use this to "unshift" already processed tiles (e.g., ply_L93_ortho -> local).
-    cfg.sign
-        +1 shift, -1 unshift.
-    cfg.out_subdir
-        Output folder under run_*.
+    wasure_out_dir : str | Path
+        Répertoire du run WaSuRe (`run_*`).
+    logger : logging.Logger
+        Logger du pipeline.
+    cfg : PostWasureShiftConfig
+        Configuration (signe, propriétés à translater, ASCII/binaire, overwrite, sous-dossier de sortie).
+    tiles_dir : str | Path | None
+        Répertoire d'entrée contenant les tuiles PLY.
+        - Si None : auto-détection via `_find_tiles_dir(<run>)` (par défaut `<run>/outputs/tiles`).
+        - Utile pour traiter un jeu de tuiles déjà post-traitées (ex. pour "unshift" une sortie).
 
     Returns
     -------
     Path
-        Output directory containing translated PLY tiles.
+        Répertoire de sortie contenant les PLY translatés : `<wasure_out_dir>/<cfg.out_subdir>`.
+
+    Raises
+    ------
+    RuntimeError
+        - si le fichier XML metadata est absent,
+        - si le répertoire de tuiles est introuvable,
+        - si aucune tuile `.ply` n'est trouvée,
+        - si une tuile provoque une erreur (exception relancée après log).
     """
     wasure_out_dir = Path(wasure_out_dir)
 

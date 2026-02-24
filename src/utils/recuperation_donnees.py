@@ -1,8 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Script de récupération des données nécessaires aux traitements
+Récupération des données nécessaires au pipeline de mise à jour de mesh.
 
-@author: ESaint-Denis
+Ce module orchestre l'acquisition des données d'entrée du pipeline :
+- Nuages de points LiDAR : téléchargés depuis une liste d'URL (un fichier texte).
+- MNS de corrélation : copiés depuis un store interne (arborescence normalisée),
+  avec recherche automatique du département via un WFS "départements", puis
+  sélection du millésime le plus récent disponible.
+- MNS LiDAR HD : optionnellement récupérés via une requête WFS (GeoJSON) permettant
+  d'obtenir une URL WMS-R/HTTP de téléchargement du GeoTIFF.
+
+Le module inclut :
+- une configuration (RetrievalConfig),
+- des utilitaires robustes de téléchargement (urllib + fallback curl),
+- des utilitaires de parsing (indices de dalle km depuis les noms de fichiers),
+- une fonction principale d'orchestration (run_retrieval).
+
+Auteur : ESaint-Denis
 """
 
 # utils/recuperation_donnees.py
@@ -15,14 +29,13 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 import os
 import subprocess
 import urllib.error
 import platform
-from dataclasses import dataclass
 from datetime import datetime
 
 
@@ -34,15 +47,49 @@ _TILE_RE = re.compile(r"_(\d{4})_(\d{4})_")
 
 
 class MissingCorrelationDSMError(RuntimeError):
-    """Erreur levée quand au moins une dalle MNS corrélation manque sur le store (bloquant)."""
+    """Erreur levée lorsqu'au moins une dalle MNS de corrélation est manquante sur le store (cas bloquant)."""
 
 
 class MissingLidarDSMError(RuntimeError):
-    """Erreur levée quand au moins une dalle MNS LiDAR HD ne peut pas être récupérée (optionnellement bloquant)."""
+    """Erreur levée lorsqu'une dalle MNS LiDAR HD ne peut pas être récupérée (cas éventuellement bloquant)."""
 
 
 @dataclass(frozen=True)
 class RetrievalConfig:
+    """
+    Configuration de la récupération des données.
+
+    Attributs
+    ---------
+    store_root : Path
+        Racine du store interne contenant les dalles MNS de corrélation.
+
+    year_start : int
+        Année de départ pour la recherche des MNS de corrélation (par défaut : année courante),
+        la recherche se fait ensuite à rebours (year_start, year_start-1, ...).
+
+    year_stop : int
+        Année minimale incluse pour la recherche des MNS de corrélation.
+
+    dep_wfs : DepartementWfsConfig
+        Configuration du WFS "départements" utilisé pour déterminer les départements
+        intersectant une dalle km (utile pour retrouver le bon répertoire de store).
+
+    wfs_endpoint : str
+        URL du endpoint WFS utilisé pour interroger la couche des dalles MNS LiDAR HD.
+
+    wfs_type_name : str
+        Nom de la couche WFS des dalles MNS LiDAR HD (typeName / typeNames).
+
+    wfs_srs : str
+        Système de référence spatiale utilisé dans les requêtes WFS (ex. EPSG:2154).
+
+    Notes
+    -----
+    - La recherche des MNS de corrélation combine (département via WFS) + (année décroissante)
+      pour trouver le millésime le plus récent disponible.
+    - La récupération des MNS LiDAR HD repose sur un attribut 'url' renvoyé par le WFS.
+    """
     # Correlation DSM store
     store_root: Path
 
@@ -60,7 +107,23 @@ class RetrievalConfig:
 
 
 def setup_logger(logs_dir: Path, name: str = "recuperation_donnees") -> logging.Logger:
-    """Configure un logger avec sortie fichier horodatée + console."""
+    """
+    Configure un logger avec :
+    - sortie fichier horodatée dans le répertoire de logs,
+    - sortie console.
+
+    Parameters
+    ----------
+    logs_dir : Path
+        Répertoire où écrire les logs.
+    name : str
+        Nom du logger (et préfixe du fichier de log).
+
+    Returns
+    -------
+    logging.Logger
+        Logger prêt à l'emploi.
+    """
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     ts = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -86,8 +149,14 @@ def setup_logger(logs_dir: Path, name: str = "recuperation_donnees") -> logging.
     logger.info("Log file: %s", log_file)
     return logger
 
+
 def _log_proxy_env(logger) -> None:
-    """Log proxy-related environment variables (useful on servers)."""
+    """
+    Journalise les variables d'environnement liées au proxy.
+
+    Utile pour diagnostiquer des problèmes de téléchargement sur serveurs
+    ou environnements d'entreprise (proxy HTTP/HTTPS).
+    """
     keys = ["http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "all_proxy", "ALL_PROXY"]
     vals = {k: os.environ.get(k) for k in keys if os.environ.get(k)}
     if vals:
@@ -95,14 +164,31 @@ def _log_proxy_env(logger) -> None:
     else:
         logger.info("Aucun proxy env détecté (http_proxy/https_proxy/no_proxy).")
 
+
 def resolve_store_root(cfg: RetrievalConfig) -> Path:
     """
-    Resolve the store root path for MNS correlation tiles.
+    Détermine la racine du store des dalles MNS de corrélation.
 
-    Priority:
-    1) cfg.store_root if provided
-    2) environment variable MNS_CORREL_STORE_ROOT
-    3) platform-based defaults (Linux mount path first, then UNC on Windows)
+    Ordre de priorité :
+    1) cfg.store_root si fourni
+    2) variable d'environnement MNS_CORREL_STORE_ROOT
+    3) valeurs par défaut dépendantes de la plateforme (Linux puis UNC Windows)
+
+    Parameters
+    ----------
+    cfg : RetrievalConfig
+        Configuration de récupération.
+
+    Returns
+    -------
+    Path
+        Chemin de la racine du store à utiliser.
+
+    Notes
+    -----
+    - Si aucun candidat n'existe réellement, la fonction renvoie quand même
+      un chemin "le plus probable" selon l'OS, afin d'améliorer les messages
+      d'erreur en aval.
     """
     # 1) Explicit config
     if cfg.store_root is not None:
@@ -134,8 +220,27 @@ def resolve_store_root(cfg: RetrievalConfig) -> Path:
 
 def _download_with_curl(url: str, dst_path: Path, logger, timeout_s: int = 300, retries: int = 5) -> None:
     """
-    Download using curl (often more robust behind corporate proxies).
-    Uses resume (-C -) and follows redirects (-L).
+    Télécharge un fichier en utilisant `curl`.
+
+    Cette méthode est souvent plus robuste derrière des proxys (ou en présence
+    d'erreurs intermittentes). Elle :
+    - suit les redirections (-L),
+    - échoue explicitement sur erreurs HTTP (-f),
+    - reprend un téléchargement partiel (-C -),
+    - réessaie automatiquement (--retry).
+
+    Parameters
+    ----------
+    url : str
+        URL de téléchargement.
+    dst_path : Path
+        Chemin du fichier de sortie.
+    logger :
+        Logger.
+    timeout_s : int
+        Durée maximale de téléchargement.
+    retries : int
+        Nombre de tentatives côté curl.
     """
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -164,7 +269,21 @@ def _download_with_curl(url: str, dst_path: Path, logger, timeout_s: int = 300, 
 
 
 def read_lidar_urls(txt_path: str | Path) -> list[str]:
-    """Lit un fichier texte contenant 1 URL LiDAR par ligne (ignore lignes vides et commentaires '#')."""
+    """
+    Lit un fichier texte contenant une URL LiDAR par ligne.
+
+    Les lignes vides et les lignes commençant par `#` (commentaires) sont ignorées.
+
+    Parameters
+    ----------
+    txt_path : str | Path
+        Chemin du fichier texte.
+
+    Returns
+    -------
+    list[str]
+        Liste des URL lues.
+    """
     p = Path(txt_path).expanduser().resolve()
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
 
@@ -180,6 +299,24 @@ def read_lidar_urls(txt_path: str | Path) -> list[str]:
 
 
 def _filename_from_url(url: str) -> str:
+    """
+    Extrait le nom de fichier depuis une URL.
+
+    Parameters
+    ----------
+    url : str
+        URL d'un fichier (ex. .../mon_fichier.laz).
+
+    Returns
+    -------
+    str
+        Nom du fichier (sans répertoires).
+
+    Raises
+    ------
+    ValueError
+        Si aucun nom n'est extractible depuis l'URL.
+    """
     parsed = urlparse(url)
     name = Path(parsed.path).name
     if not name:
@@ -189,8 +326,25 @@ def _filename_from_url(url: str) -> str:
 
 def _parse_tile_xy_from_lidar_filename(lidar_filename: str) -> tuple[int, int]:
     """
-    Extrait (x_km, y_km) depuis un nom du style:
+    Extrait les indices de dalle kilométrique (x_km, y_km) depuis un nom LiDAR.
+
+    Exemple de motif attendu (présence de _XXXX_YYYY_) :
     LHD_FXX_0605_6933_PTS_LAMB93_IGN69.copc.laz
+
+    Parameters
+    ----------
+    lidar_filename : str
+        Nom de fichier LiDAR.
+
+    Returns
+    -------
+    tuple[int, int]
+        (x_km, y_km) indices kilométriques extraits.
+
+    Raises
+    ------
+    ValueError
+        Si le motif n'est pas détecté.
     """
     m = _TILE_RE.search(lidar_filename)
     if not m:
@@ -201,7 +355,22 @@ def _parse_tile_xy_from_lidar_filename(lidar_filename: str) -> tuple[int, int]:
 
 
 def _km_to_m_str(km: int) -> str:
-    """Convertit un index km sur 4 chiffres en coordonnée mètres sur 7 chiffres. Ex: 0605 -> 0605000"""
+    """
+    Convertit un index kilométrique (4 chiffres) en coordonnée mètres (7 chiffres).
+
+    Exemple :
+    - 0605 -> 0605000
+
+    Parameters
+    ----------
+    km : int
+        Indice kilométrique.
+
+    Returns
+    -------
+    str
+        Coordonnée en mètres formatée sur 7 chiffres.
+    """
     m = km * 1000
     return str(m).zfill(7)
 
@@ -211,8 +380,24 @@ def _km_to_m_str(km: int) -> str:
 # -----------------------------
 def build_mns_correlation_folder(store_root: Path, year_yyyy: int, dep_code_insee: str) -> Path:
     """
-    Build:
+    Construit le chemin de dossier du store interne pour les MNS de corrélation.
+
+    Convention attendue :
     <store_root>/LAMB93_<YYYY>/MNS_TIFF_RGF93LAMB93_<YY>FD<DEP>20/data
+
+    Parameters
+    ----------
+    store_root : Path
+        Racine du store.
+    year_yyyy : int
+        Millésime (année sur 4 chiffres).
+    dep_code_insee : str
+        Code département (convention store, voir `normalize_dep_code_for_store`).
+
+    Returns
+    -------
+    Path
+        Chemin du dossier `data` contenant les tuiles.
     """
     yyyy = int(year_yyyy)
     yy = yyyy % 100
@@ -222,7 +407,23 @@ def build_mns_correlation_folder(store_root: Path, year_yyyy: int, dep_code_inse
 
 
 def build_mns_correlation_filename(year_yyyy: int, dep_code_insee: str, x_km: int, y_km: int) -> str:
-    """Build expected correlation DSM filename from (year, dep, x_km, y_km)."""
+    """
+    Construit le nom attendu d'une dalle MNS de corrélation à partir des paramètres.
+
+    Parameters
+    ----------
+    year_yyyy : int
+        Millésime (année sur 4 chiffres).
+    dep_code_insee : str
+        Code département selon la convention du store.
+    x_km, y_km : int
+        Indices kilométriques de la tuile.
+
+    Returns
+    -------
+    str
+        Nom de fichier GeoTIFF attendu.
+    """
     yyyy = int(year_yyyy)
     yy = yyyy % 100
     dep = str(dep_code_insee)
@@ -232,23 +433,34 @@ def build_mns_correlation_filename(year_yyyy: int, dep_code_insee: str, x_km: in
     y_m = _km_to_m_str(y_km)
     return f"MNS_CORREL_1-0_LAMB93_{lot}_{x_m}_{y_m}.tif"
 
+
 def normalize_dep_code_for_store(dep: str) -> str:
     """
-    Normalize department code for correlation DSM store naming.
+    Normalise un code département pour correspondre à la convention du store MNS corrélation.
 
-    Store convention:
-    - Corsica is stored as '20' (covers both 2A and 2B)
-    - Metropolitan departments use 2 digits (01..95)
-    - Overseas departments use 3 digits (971..976)
-    - WFS may return 3-digit with leading zero (e.g., '076')
+    Conventions du store :
+    - La Corse est stockée sous la forme '20' (couvre 2A et 2B).
+    - Départements métropolitains : 2 chiffres (01..95).
+    - Départements d'outre-mer : 3 chiffres (971..976).
+    - Certaines sources (WFS) peuvent renvoyer un code à 3 chiffres avec zéro initial (ex. '076').
 
-    Examples:
+    Exemples :
     - '076' -> '76'
     - '6'   -> '06'
     - '06'  -> '06'
     - '2A'  -> '20'
     - '2B'  -> '20'
     - '971' -> '971'
+
+    Parameters
+    ----------
+    dep : str
+        Code département en entrée.
+
+    Returns
+    -------
+    str
+        Code normalisé pour le store.
     """
     dep = str(dep).strip().upper()
 
@@ -274,11 +486,31 @@ def find_latest_mns_correlation_tile(
     y_km: int,
 ) -> Path | None:
     """
-    Find the newest available correlation DSM for a tile by:
-    1) listing intersecting departments (code_insee) via WFS
-    2) trying years from cfg.year_start down to cfg.year_stop
-    3) for each year, trying departments in decreasing intersection area order
-    Returns the first existing file path, or None if not found.
+    Recherche la dalle MNS de corrélation la plus récente disponible pour une tuile donnée.
+
+    Stratégie :
+    1) détermination des départements intersectant la tuile via WFS,
+    2) normalisation des codes département selon la convention du store,
+    3) parcours des années de cfg.year_start à cfg.year_stop (décroissant),
+    4) pour chaque année, test des départements (ordre décroissant d'aire d'intersection),
+    5) renvoi du premier chemin existant.
+
+    Parameters
+    ----------
+    cfg : RetrievalConfig
+        Configuration (store + politiques de recherche + WFS départements).
+    x_km, y_km : int
+        Indices kilométriques de la tuile.
+
+    Returns
+    -------
+    Path | None
+        Chemin du fichier existant si trouvé, sinon None.
+
+    Notes
+    -----
+    - La fonction tente de déduire le "bon" département si une tuile intersecte plusieurs départements.
+    - Les messages [DEBUG] actuels sont laissés tels quels.
     """
     deps = get_departements_for_tile_bbox(x_km, y_km, cfg.dep_wfs)
     dep_codes = [normalize_dep_code_for_store(d) for (d, _area) in deps]
@@ -297,11 +529,26 @@ def find_latest_mns_correlation_tile(
 
     return None
 
+
 # -----------------------------
 # MNS LiDAR HD (WFS -> url WMS-R)
 # -----------------------------
 def _http_get_json(url: str, timeout_s: int = 60) -> dict[str, Any]:
-    """GET HTTP et parse JSON."""
+    """
+    Effectue une requête HTTP GET et interprète la réponse comme du JSON.
+
+    Parameters
+    ----------
+    url : str
+        URL à interroger.
+    timeout_s : int
+        Timeout réseau.
+
+    Returns
+    -------
+    dict[str, Any]
+        Objet JSON décodé.
+    """
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=timeout_s) as resp:
         data = resp.read()
@@ -309,7 +556,19 @@ def _http_get_json(url: str, timeout_s: int = 60) -> dict[str, Any]:
 
 
 def _find_url_property(properties: dict[str, Any]) -> str | None:
-    """Récupère la propriété 'url' quelle que soit la casse éventuelle."""
+    """
+    Recherche une propriété nommée 'url' indépendamment de la casse.
+
+    Parameters
+    ----------
+    properties : dict[str, Any]
+        Dictionnaire de propriétés (ex. properties d'une feature GeoJSON).
+
+    Returns
+    -------
+    str | None
+        Valeur de l'URL si trouvée, sinon None.
+    """
     for k, v in properties.items():
         if isinstance(k, str) and k.lower() == "url":
             return str(v) if v is not None else None
@@ -318,12 +577,34 @@ def _find_url_property(properties: dict[str, Any]) -> str | None:
 
 def get_mns_lidar_download_url_from_wfs(cfg: RetrievalConfig, x_km: int, y_km: int, logger: logging.Logger) -> str:
     """
-    Interroge le WFS sur une petite BBOX au centre de la dalle km, et récupère l'attribut 'url'.
+    Interroge le WFS des dalles MNS LiDAR HD et récupère l'URL de téléchargement.
 
-    Hypothèse de repère:
-    - x_km -> x0 = x_km * 1000 est le bord Ouest (mètres).
-    - y_km -> y_top = y_km * 1000 est le bord Nord (mètres),
-      et la dalle fait 1000 m vers le Sud.
+    La requête WFS est faite sur une très petite BBOX centrée sur la dalle km afin
+    d'obtenir la feature correspondante, puis l'attribut `url`.
+
+    Hypothèses de repère (EPSG:2154) :
+    - x_km -> x0 = x_km * 1000 : bord Ouest (mètres).
+    - y_km -> y_top = y_km * 1000 : bord Nord (mètres).
+    - la dalle fait 1000 m vers le Sud.
+
+    Parameters
+    ----------
+    cfg : RetrievalConfig
+        Configuration WFS (endpoint, typename, SRS).
+    x_km, y_km : int
+        Indices kilométriques de la dalle.
+    logger : logging.Logger
+        Logger.
+
+    Returns
+    -------
+    str
+        URL de téléchargement (souvent un lien WMS-R/HTTP).
+
+    Raises
+    ------
+    RuntimeError
+        Si aucune feature n'est trouvée ou si l'attribut 'url' est absent/inexploitable.
     """
     x0 = x_km * 1000
     y_top = y_km * 1000
@@ -337,7 +618,6 @@ def get_mns_lidar_download_url_from_wfs(cfg: RetrievalConfig, x_km: int, y_km: i
     bbox = f"{xc-eps},{yc-eps},{xc+eps},{yc+eps},{cfg.wfs_srs}"
 
     # Requête WFS GetFeature (GeoJSON)
-    # Important: outputFormat en JSON, et restriction par BBOX.
     wfs_url = (
         f"{cfg.wfs_endpoint}"
         f"?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature"
@@ -355,7 +635,6 @@ def get_mns_lidar_download_url_from_wfs(cfg: RetrievalConfig, x_km: int, y_km: i
     if not feats:
         raise RuntimeError(f"Aucune feature WFS trouvée pour la dalle {x_km}_{y_km} (bbox centre).")
 
-    # Si plusieurs, on prend la première (la bbox est minuscule, ça devrait être unique)
     props = feats[0].get("properties", {})
     if not isinstance(props, dict):
         raise RuntimeError("Réponse WFS inattendue: 'properties' invalide.")
@@ -369,8 +648,22 @@ def get_mns_lidar_download_url_from_wfs(cfg: RetrievalConfig, x_km: int, y_km: i
 
 def _filename_from_wmsr_url(wms_url: str, fallback: str) -> str:
     """
-    Extrait le paramètre FILENAME=... depuis l'URL WMS-R si présent.
-    Sinon retourne fallback.
+    Extrait un nom de fichier depuis une URL WMS-R.
+
+    Si le paramètre FILENAME=... (ou filename=...) est présent, il est utilisé.
+    Sinon, la valeur `fallback` est renvoyée.
+
+    Parameters
+    ----------
+    wms_url : str
+        URL WMS-R/HTTP.
+    fallback : str
+        Nom utilisé si aucun paramètre n'est détecté.
+
+    Returns
+    -------
+    str
+        Nom de fichier retenu.
     """
     parsed = urlparse(wms_url)
     qs = parse_qs(parsed.query)
@@ -393,28 +686,35 @@ def download_file(
     use_curl_fallback: bool = True,
 ) -> None:
     """
-    Télécharge un fichier URL -> dst_path, avec:
-    - logs détaillés
-    - écriture via fichier .part dans tmp_dir (puis rename atomique)
-    - retries en cas d'erreurs transitoires (502/503/504, timeouts)
-    - fallback curl (optionnel) si urllib échoue (utile en environnement proxy)
+    Télécharge un fichier depuis une URL vers un chemin local.
+
+    Fonctionnalités :
+    - journalisation détaillée,
+    - écriture via un fichier temporaire `.part` dans tmp_dir (puis renommage atomique),
+    - tentatives multiples en cas d'erreurs transitoires (timeouts, 502/503/504),
+    - fallback `curl` (optionnel) si `urllib` échoue (utile derrière proxy).
 
     Parameters
     ----------
     url : str
         URL du fichier à télécharger.
     dst_path : Path
-        Chemin final.
+        Chemin final du fichier.
     tmp_dir : Path
-        Dossier temporaire pour le fichier .part.
+        Dossier temporaire pour le fichier `.part`.
     logger :
         Logger (logging.Logger).
     timeout_s : int
         Timeout réseau pour urllib/curl.
     overwrite : bool
-        Si False et dst existe => on skip.
+        Si False et dst_path existe déjà (taille > 0), le téléchargement est ignoré.
     use_curl_fallback : bool
-        Si True => fallback curl si urllib échoue.
+        Si True, déclenche un téléchargement via curl en cas d'échec urllib.
+
+    Raises
+    ------
+    RuntimeError
+        Si le téléchargement échoue (urllib + éventuellement curl) ou produit un fichier vide.
     """
     dst_path = Path(dst_path)
     tmp_dir = Path(tmp_dir)
@@ -494,8 +794,20 @@ def download_file(
 
     raise RuntimeError(f"Echec téléchargement: {url}: {last_err}") from last_err
 
+
 def copy_if_needed(src: Path, dst: Path, logger: logging.Logger) -> None:
-    """Copie src -> dst si dst n'existe pas."""
+    """
+    Copie un fichier source vers une destination si la destination n'existe pas déjà.
+
+    Parameters
+    ----------
+    src : Path
+        Fichier source.
+    dst : Path
+        Fichier destination.
+    logger : logging.Logger
+        Logger.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     if dst.exists():
@@ -519,19 +831,40 @@ def run_retrieval(
     strict_missing_mns_lidar: bool = False,
 ) -> None:
     """
-    Récupère:
-    - Nuage points LiDAR (download depuis URLs)
-    - MNS corrélation (copy depuis store interne) -> bloquant si manquant (selon strict_missing_mns_correlation)
-    - MNS LiDAR HD (optionnel) via WFS->url (WMS-R) -> téléchargement GeoTIFF
+    Exécute la récupération des données d'entrée du pipeline.
 
-    Paramètres
+    Étapes :
+    1) Téléchargement des nuages de points LiDAR à partir d'un fichier d'URL.
+    2) Pour chaque tuile (x_km, y_km) déduite du nom LiDAR :
+       - recherche de la dalle MNS de corrélation la plus récente dans le store interne,
+       - copie de la dalle trouvée dans le dossier projet correspondant.
+    3) Optionnel : récupération du MNS LiDAR HD via WFS (URL WMS-R), puis téléchargement du GeoTIFF.
+
+    Parameters
     ----------
-    strict_missing_mns_correlation
-        Si True: manque d'une dalle MNS corrélation = arrêt immédiat (bloquant).
-    fetch_mns_lidar
-        Si True: tente de récupérer les dalles MNS LiDAR HD via WFS.
-    strict_missing_mns_lidar
-        Si True: manque MNS LiDAR HD = arrêt (sinon warning).
+    paths : ProjectPaths
+        Arborescence du projet (répertoires de sortie).
+    lidar_urls_txt : str | Path
+        Fichier texte contenant une URL LiDAR par ligne.
+    cfg : RetrievalConfig
+        Configuration (store, politiques de recherche, accès WFS).
+    strict_missing_mns_correlation : bool, default=True
+        Si True : l'absence d'une dalle MNS de corrélation est bloquante (exception).
+        Si False : l'absence est journalisée, et la tuile est ignorée.
+    fetch_mns_lidar : bool, default=True
+        Si True : tente de récupérer les dalles MNS LiDAR HD via WFS.
+    strict_missing_mns_lidar : bool, default=False
+        Si True : l'échec de récupération MNS LiDAR HD est bloquant (exception).
+        Si False : l'échec produit un warning et le traitement continue.
+
+    Raises
+    ------
+    MissingCorrelationDSMError
+        Si une dalle MNS corrélation est manquante et `strict_missing_mns_correlation=True`.
+    MissingLidarDSMError
+        Si une dalle MNS LiDAR HD est manquante et `strict_missing_mns_lidar=True`.
+    RuntimeError
+        En cas d'erreur de téléchargement ou de requête WFS.
     """
     logger = setup_logger(paths.logs)
 

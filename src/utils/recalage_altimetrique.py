@@ -1,8 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Recalage altimétrique des dalles MNS de corrélation sur les dalles MNS LiDAR
+Recalage altimétrique des dalles MNS de corrélation sur les dalles MNS LiDAR.
 
-@author: ESaint-Denis
+Ce module estime un décalage vertical (offset) entre :
+- un MNS issu de corrélation (référence de grille),
+- un MNS issu du LiDAR (ré-échantillonné sur la grille du MNS corrélation),
+
+puis applique ce décalage au MNS de corrélation afin de produire un MNS recalé.
+
+Principe général :
+1) lecture du MNS corrélation (grille de référence),
+2) ré-échantillonnage du MNS LiDAR sur la même grille,
+3) calcul dz = corr - lidar_resampled,
+4) estimation robuste de Δz par médiane + filtrage itératif MAD,
+5) écriture du MNS corrélation corrigé : corr_recale = corr - Δz.
+
+Auteur : ESaint-Denis
 """
 
 # utils/recalage_altimetrique.py
@@ -27,11 +40,33 @@ _TILE_RE_M  = re.compile(r"_(\d{7})_(\d{7})")  # ex: _0605000_6933000
 
 
 class MissingMatchingTileError(RuntimeError):
-    """Erreur levée quand on ne trouve pas de correspondance MNS LiDAR / MNS corrélation."""
+    """Erreur levée lorsqu'aucune correspondance MNS LiDAR / MNS corrélation n'est trouvée pour une dalle."""
 
 
 @dataclass(frozen=True)
 class RecalageConfig:
+    """
+    Paramètres du recalage altimétrique.
+
+    Attributs
+    ---------
+    k_mad : float
+        Facteur multiplicatif appliqué à l'écart-type robuste (estimé via MAD)
+        pour filtrer les résidus (pixels considérés "stables").
+
+    n_iter : int
+        Nombre d'itérations maximum du filtrage itératif MAD.
+
+    resampling : rasterio.warp.Resampling
+        Méthode de ré-échantillonnage utilisée pour projeter le MNS LiDAR sur la
+        grille du MNS corrélation (ex. bilinear).
+
+    compress : str
+        Compression GeoTIFF appliquée à l'écriture (ex. "deflate").
+
+    overwrite : bool
+        Si True, réécrit les fichiers de sortie s'ils existent déjà.
+    """
     k_mad: float = 3.0
     n_iter: int = 3
     resampling: Resampling = Resampling.bilinear
@@ -41,11 +76,26 @@ class RecalageConfig:
 
 def _parse_tile_xy_from_any_filename(name: str) -> tuple[int, int]:
     """
-    Extrait (x_km, y_km) depuis un nom de fichier.
+    Extrait les indices de dalle kilométrique (x_km, y_km) depuis un nom de fichier.
 
-    Supporte 2 formats:
-    - km: ..._0605_6933_...
-    - m : ..._0605000_6933000...
+    Deux formats sont supportés :
+    - Format "km" : ..._0605_6933_...
+    - Format "m"  : ..._0605000_6933000...
+
+    Parameters
+    ----------
+    name : str
+        Nom de fichier.
+
+    Returns
+    -------
+    tuple[int, int]
+        (x_km, y_km) indices kilométriques.
+
+    Raises
+    ------
+    ValueError
+        Si le motif n'est pas détecté ou si des coordonnées mètres ne sont pas multiples de 1000.
     """
     m_km = _TILE_RE_KM.search(name)
     if m_km:
@@ -66,8 +116,30 @@ def _parse_tile_xy_from_any_filename(name: str) -> tuple[int, int]:
 
 def _find_mns_lidar_file_for_tile(mns_lidar_dir: Path, x_km: int, y_km: int) -> Path:
     """
-    Retrouve le fichier MNS LiDAR correspondant à la dalle (x_km, y_km) dans MNS_lidar/.
-    On cherche un .tif qui contient _XXXX_YYYY_ et aussi '_MNS_' pour éviter les faux positifs.
+    Recherche le fichier MNS LiDAR correspondant à une dalle (x_km, y_km).
+
+    Stratégie :
+    - on parcourt les GeoTIFF (*.tif) du répertoire `mns_lidar_dir`,
+    - on retient ceux dont le nom contient `_{XXXX}_{YYYY}_`,
+    - on impose en plus la présence de `_MNS_` pour limiter les faux positifs,
+    - si plusieurs candidats existent, on prend le plus récent (mtime).
+
+    Parameters
+    ----------
+    mns_lidar_dir : Path
+        Répertoire contenant les dalles MNS LiDAR.
+    x_km, y_km : int
+        Indices kilométriques de la dalle.
+
+    Returns
+    -------
+    Path
+        Chemin du fichier MNS LiDAR retenu.
+
+    Raises
+    ------
+    MissingMatchingTileError
+        Si aucun fichier correspondant n'est trouvé.
     """
     pattern = f"_{x_km:04d}_{y_km:04d}_"
     candidates = []
@@ -89,7 +161,19 @@ def _find_mns_lidar_file_for_tile(mns_lidar_dir: Path, x_km: int, y_km: int) -> 
 
 def read_raster(path: Path) -> tuple[np.ndarray, float | int | None, dict]:
     """
-    Lit la bande 1 d'un raster et renvoie (array float32, nodata, profile).
+    Lit un raster (bande 1) et renvoie l'image + nodata + profil rasterio.
+
+    Parameters
+    ----------
+    path : Path
+        Chemin du fichier raster.
+
+    Returns
+    -------
+    tuple[np.ndarray, float | int | None, dict]
+        - array : tableau float32 de la bande 1,
+        - nodata : valeur nodata (ou None),
+        - profile : profil rasterio (copie) pour l'écriture.
     """
     with rasterio.open(path) as src:
         arr = src.read(1).astype(np.float32)
@@ -104,7 +188,25 @@ def resample_to_reference_grid(
     resampling: Resampling = Resampling.bilinear,
 ) -> np.ndarray:
     """
-    Reprojette / ré-échantillonne src_path sur la grille définie par ref_profile.
+    Ré-échantillonne un raster sur la grille définie par un profil de référence.
+
+    Cette fonction utilise `rasterio.warp.reproject` pour :
+    - reprojeter si nécessaire,
+    - et/ou ré-échantillonner sur la transformée et la taille de la grille de référence.
+
+    Parameters
+    ----------
+    src_path : Path
+        Raster source à reprojecter / ré-échantillonner.
+    ref_profile : dict
+        Profil rasterio définissant la grille destination (width, height, transform, crs, nodata...).
+    resampling : rasterio.warp.Resampling
+        Méthode de ré-échantillonnage.
+
+    Returns
+    -------
+    np.ndarray
+        Tableau float32 ré-échantillonné sur la grille de référence.
     """
     ref_h = ref_profile["height"]
     ref_w = ref_profile["width"]
@@ -134,12 +236,44 @@ def robust_offset_from_dz(
     n_iter: int = 3,
 ) -> tuple[float, np.ndarray]:
     """
-    Estime un décalage vertical robuste (médiane) via filtrage MAD itératif.
-    Renvoie (delta_z, stable_mask).
+    Estime un décalage vertical robuste (Δz) par médiane avec filtrage MAD itératif.
 
-    Convention:
-      dz = new - old
-      delta_z = median(dz sur pixels stables)
+    Entrées :
+    - dz : tableau des différences d'altitude pixel à pixel,
+    - valid_mask : masque des pixels exploitables (finite, != nodata, etc.).
+
+    Algorithme (itératif) :
+    1) calcul de la médiane sur les pixels courants,
+    2) calcul des résidus r = dz - médiane,
+    3) estimation robuste de la dispersion via MAD,
+    4) conservation des pixels dont |r - med(r)| <= k_mad * 1.4826 * MAD,
+    5) répétition jusqu'à n_iter.
+
+    Convention :
+    - dz = new - old (ici : dz = corr - lidar_resampled)
+    - Δz = médiane(dz sur pixels stables)
+
+    Parameters
+    ----------
+    dz : np.ndarray
+        Différences verticales pixel à pixel.
+    valid_mask : np.ndarray
+        Masque booléen des pixels valides.
+    k_mad : float
+        Seuil de rejet en nombre d'écarts-types robustes.
+    n_iter : int
+        Nombre d'itérations du filtrage.
+
+    Returns
+    -------
+    tuple[float, np.ndarray]
+        - delta_z : décalage vertical robuste estimé (mètres),
+        - stable_mask : masque final des pixels conservés ("stables").
+
+    Raises
+    ------
+    RuntimeError
+        Si aucun pixel valide ne subsiste pour estimer Δz.
     """
     mask = valid_mask.copy()
     delta = 0.0
@@ -168,7 +302,23 @@ def robust_offset_from_dz(
 
 def _build_valid_mask(arr: np.ndarray, nodata: float | int | None) -> np.ndarray:
     """
-    Construit un masque de validité pour un raster : finite + != nodata.
+    Construit un masque des pixels valides d'un raster.
+
+    Un pixel est valide si :
+    - la valeur est finie (pas NaN/Inf),
+    - et (si nodata est défini) la valeur est différente de nodata.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Tableau raster.
+    nodata : float | int | None
+        Valeur nodata, ou None.
+
+    Returns
+    -------
+    np.ndarray
+        Masque booléen des pixels valides.
     """
     valid = np.isfinite(arr)
     if nodata is not None:
@@ -186,8 +336,33 @@ def write_corrected_dem(
     overwrite: bool = True,
 ) -> None:
     """
-    Écrit le MNS corrélation recalé : dem_new_corr = dem_new - delta_z
-    en préservant le nodata.
+    Écrit un MNS corrigé par décalage vertical.
+
+    Correction appliquée :
+    - dem_corr = dem_new - delta_z
+
+    Le nodata est préservé : les pixels nodata dans `dem_new` restent nodata dans `dem_corr`.
+
+    Parameters
+    ----------
+    ref_profile : dict
+        Profil rasterio à utiliser pour l'écriture (transform, crs, dimensions...).
+    dem_new : np.ndarray
+        MNS à corriger (tableau).
+    nodata_new : float | int | None
+        Valeur nodata associée à dem_new.
+    delta_z : float
+        Décalage vertical estimé (mètres).
+    out_path : Path
+        Chemin du fichier GeoTIFF de sortie.
+    compress : str
+        Compression GeoTIFF.
+    overwrite : bool
+        Si False et le fichier existe, ne réécrit pas.
+
+    Returns
+    -------
+    None
     """
     if out_path.exists() and not overwrite:
         return
@@ -213,16 +388,37 @@ def run_recalage_altimetrique(
     """
     Recale altimétriquement les dalles MNS de corrélation sur les dalles MNS LiDAR.
 
-    - Entrées :
-        * paths.mns_correlation : dalles MNS corrélation (grille de référence)
-        * paths.mns_lidar       : dalles MNS LiDAR (à resampler sur la grille corr)
-    - Sorties :
-        * paths.mns_recale      : dalles MNS corrélation corrigées (mêmes noms)
+    Entrées
+    -------
+    - paths.mns_correlation :
+        Dalles MNS de corrélation (utilisées comme grille de référence).
+    - paths.mns_lidar :
+        Dalles MNS LiDAR (ré-échantillonnées sur la grille corrélation).
 
-    Convention du décalage :
-        dz = corr - lidar_resampled
-        delta_z = median(dz) sur pixels stables
-        corr_recale = corr - delta_z
+    Sorties
+    -------
+    - paths.mns_recale :
+        Dalles MNS de corrélation corrigées (même nom que l'entrée).
+
+    Convention du décalage
+    ----------------------
+    - dz = corr - lidar_resampled
+    - delta_z = médiane(dz) estimée sur pixels stables (filtrage MAD)
+    - corr_recale = corr - delta_z
+
+    Parameters
+    ----------
+    paths : ProjectPaths
+        Arborescence du projet (répertoires d'entrée/sortie).
+    cfg : RecalageConfig
+        Paramètres du recalage (k_mad, n_iter, resampling, compression, overwrite).
+
+    Raises
+    ------
+    RuntimeError
+        Si aucun fichier MNS corrélation n'est trouvé, ou si l'estimation échoue.
+    MissingMatchingTileError
+        Si aucun MNS LiDAR correspondant n'est trouvé pour une dalle.
     """
     logger = setup_logger(paths.logs, name="recalage_altimetrique")
 

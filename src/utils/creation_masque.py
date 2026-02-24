@@ -1,9 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Création du masque de changement par différentiel de MNS entre MNS LiDAr et MNS de corrélation.
-Opérations géométriques et de filtrage sur le masque
+Création du masque de changement à partir d'un différentiel de MNS.
 
-@author: ESaint-Denis
+Ce module produit un masque binaire de changement (par dalle) en comparant :
+- un MNS de corrélation recalé (newer),
+- un MNS LiDAR (older), reprojeté/ré-échantillonné localement sur la grille du MNS corrélation.
+
+Le masque est calculé en plusieurs étapes :
+1) Détection brute par comparaison d'intervalles (min/max locaux) entre les deux MNS.
+2) Nettoyage morphologique (ouverture : érosion puis dilatation).
+3) Filtrage des petites composantes connexes (seuil en m²).
+4) Buffer métrique (dilatation elliptique approximant un buffer en mètres).
+
+Codage du masque (uint8) :
+- 0   : pas de changement
+- 1   : changement
+- 255 : nodata (valeur configurable)
+
+Auteur : ESaint-Denis
 """
 
 # utils/creation_masque.py
@@ -29,15 +43,44 @@ from utils.recuperation_donnees import setup_logger
 
 
 class MissingMatchingTileError(RuntimeError):
-    """Erreur levée si on ne trouve pas la dalle MNS LiDAR correspondant à la dalle corrélation recalée."""
+    """Erreur levée si aucune dalle MNS LiDAR ne correspond à une dalle de corrélation recalée."""
 
 
-# --- regex: MNS corrélation contient souvent ..._0605000_6933000.tif ---
+# --- regex: MNS corrélation contient ..._0605000_6933000.tif ---
 _TILE_RE_M = re.compile(r"_(\d{7})_(\d{7})")
 
 
 @dataclass(frozen=True)
 class MaskConfig:
+    """
+    Paramètres de génération du masque de changement.
+
+    Étapes
+    ------
+    1) Masque par comparaison d'intervalles (min/max locaux)
+       - z_tolerance_m : tolérance verticale (m) appliquée aux tests "abaissé" / "relevé"
+       - window_radius : rayon (pixels) de la fenêtre locale (R=2 -> 5x5)
+       - block_size    : taille de bloc (pixels) pour traiter par tuiles mémoire
+       - resampling    : méthode de ré-échantillonnage pour reprojecter le MNS LiDAR
+
+    2) Ouverture morphologique
+       - radius_open   : rayon (pixels) de l'élément structurant carré (R=4 -> 9x9)
+
+    3) Filtrage des petites composantes
+       - min_area_m2   : aire minimale (m²) des composantes conservées
+       - connectivity  : connectivité des composantes (4 ou 8)
+
+    4) Buffer métrique
+       - buffer_m      : distance de buffer (m) appliquée au masque binaire
+       - buffer_closing: si True, fait une fermeture (dilatation puis érosion),
+                         sinon dilatation seule (comportement du script actuel)
+
+    I/O
+    ---
+    - mask_nodata : valeur nodata du masque (uint8)
+    - compress    : compression GeoTIFF
+    - overwrite   : réécrit la sortie si déjà présente
+    """
     # Étape 1: masque intervalle
     z_tolerance_m: float | tuple[float, float] = 1.0
     window_radius: int = 2          # 2 -> 5x5
@@ -53,7 +96,7 @@ class MaskConfig:
 
     # Étape 4: buffer
     buffer_m: float = 2.0
-    buffer_closing: bool = False    # False = dilatation seule (comme ton script)
+    buffer_closing: bool = False    # False = dilatation seule
 
     # I/O
     mask_nodata: int = 255
@@ -62,7 +105,20 @@ class MaskConfig:
 
 
 def _normalize_tolerance(z_tolerance_m: float | tuple[float, float]) -> tuple[float, float]:
-    """Retourne (tol_lowering, tol_raising) en mètres."""
+    """
+    Normalise la tolérance verticale en un couple (tol_abaissement, tol_rehaussement).
+
+    Parameters
+    ----------
+    z_tolerance_m : float | tuple[float, float]
+        - si float : tolérance symétrique (t, t)
+        - si tuple/list (t_low, t_high) : tolérance asymétrique
+
+    Returns
+    -------
+    tuple[float, float]
+        (tol_low, tol_high) en mètres.
+    """
     if isinstance(z_tolerance_m, (tuple, list)) and len(z_tolerance_m) == 2:
         return float(z_tolerance_m[0]), float(z_tolerance_m[1])
     t = float(z_tolerance_m or 0.0)
@@ -71,8 +127,27 @@ def _normalize_tolerance(z_tolerance_m: float | tuple[float, float]) -> tuple[fl
 
 def _parse_tile_xy_km_from_corr_name(name: str) -> tuple[int, int]:
     """
-    Extrait (x_km, y_km) depuis un nom MNS corrélation contenant _0605000_6933000.
-    (on divise par 1000)
+    Extrait l'identifiant de dalle (x_km, y_km) depuis un nom de fichier de corrélation.
+
+    Le nom contient typiquement des coordonnées en mètres :
+    - ..._0605000_6933000...
+
+    Les valeurs extraites sont divisées par 1000 pour obtenir les indices km.
+
+    Parameters
+    ----------
+    name : str
+        Nom du fichier MNS corrélation (recalé).
+
+    Returns
+    -------
+    tuple[int, int]
+        (x_km, y_km)
+
+    Raises
+    ------
+    ValueError
+        Si le motif n'est pas détecté ou si les coordonnées ne sont pas multiples de 1000.
     """
     m = _TILE_RE_M.search(name)
     if not m:
@@ -86,8 +161,30 @@ def _parse_tile_xy_km_from_corr_name(name: str) -> tuple[int, int]:
 
 def _find_mns_lidar_file_for_tile(mns_lidar_dir: Path, x_km: int, y_km: int) -> Path:
     """
-    Retrouve la dalle MNS LiDAR correspondante dans MNS_lidar/.
-    Exemple attendu: ..._0605_6933_..._MNS_....tif
+    Retrouve la dalle MNS LiDAR correspondant à une dalle km.
+
+    Convention recherchée dans le nom :
+    - présence de `_{XXXX}_{YYYY}_`
+    - et de `_MNS_` (pour limiter les faux positifs)
+
+    Si plusieurs versions sont trouvées, la plus récente (mtime) est sélectionnée.
+
+    Parameters
+    ----------
+    mns_lidar_dir : Path
+        Répertoire des MNS LiDAR.
+    x_km, y_km : int
+        Identifiant km de la dalle.
+
+    Returns
+    -------
+    Path
+        Chemin du GeoTIFF MNS LiDAR retenu.
+
+    Raises
+    ------
+    MissingMatchingTileError
+        Si aucune dalle correspondante n'est trouvée.
     """
     pattern = f"_{x_km:04d}_{y_km:04d}_"
     candidates = [p for p in mns_lidar_dir.glob("*.tif") if pattern in p.name and "_MNS_" in p.name]
@@ -104,7 +201,21 @@ def _find_mns_lidar_file_for_tile(mns_lidar_dir: Path, x_km: int, y_km: int) -> 
 
 def _read_as_float32_with_nan(ds: rasterio.io.DatasetReader, window: Window, nodata_override=None) -> np.ndarray:
     """
-    Lit une fenêtre et remplace nodata par NaN.
+    Lit une fenêtre raster et remplace le nodata par NaN (tableau float32).
+
+    Parameters
+    ----------
+    ds : rasterio.io.DatasetReader
+        Dataset rasterio ouvert.
+    window : rasterio.windows.Window
+        Fenêtre à lire.
+    nodata_override : optional
+        Valeur nodata à utiliser à la place de ds.nodata (si fournie).
+
+    Returns
+    -------
+    np.ndarray
+        Tableau float32 avec nodata remplacé par NaN.
     """
     arr = ds.read(1, window=window, masked=False).astype(np.float32)
     nodata = nodata_override if nodata_override is not None else ds.nodata
@@ -117,9 +228,24 @@ def _read_as_float32_with_nan(ds: rasterio.io.DatasetReader, window: Window, nod
 
 def _expand_window_with_halo(core: Window, ds: rasterio.io.DatasetReader, halo: int) -> tuple[Window, int, int]:
     """
-    Étend une fenêtre core avec un halo (pour calculer un min/max glissant),
-    clampé aux limites du raster.
-    Retourne (big_window, y_off, x_off) où (y_off,x_off) est l'origine de core dans big_window.
+    Étend une fenêtre "core" avec un halo, borné aux limites du raster.
+
+    Objectif : permettre le calcul de min/max glissants sur le core, tout en disposant
+    des pixels voisins nécessaires au voisinage (rayon = halo).
+
+    Parameters
+    ----------
+    core : Window
+        Fenêtre cœur à traiter.
+    ds : rasterio.io.DatasetReader
+        Dataset rasterio (pour les limites width/height).
+    halo : int
+        Rayon (pixels) de l'extension.
+
+    Returns
+    -------
+    tuple[Window, int, int]
+        (big_window, y_off, x_off) où (y_off, x_off) est l'origine de core dans big_window.
     """
     halo = max(0, int(halo))
     x0 = int(core.col_off); y0 = int(core.row_off)
@@ -135,7 +261,25 @@ def _expand_window_with_halo(core: Window, ds: rasterio.io.DatasetReader, halo: 
 
 def _rolling_nan_minmax(arr: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Min/max glissant NaN-aware sur fenêtre carrée (2R+1)^2, sans SciPy.
+    Calcule un minimum et un maximum glissants, en ignorant les NaN, sur une fenêtre carrée.
+
+    Fenêtre utilisée : (2R+1) x (2R+1), avec R = radius.
+
+    Implementation :
+    - construction d'une vue 4D via `as_strided` sur un tableau paddé,
+    - réduction par `nanmin` / `nanmax`.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Tableau 2D (float32) contenant éventuellement des NaN.
+    radius : int
+        Rayon du voisinage en pixels (R<=0 : renvoie arr, arr).
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        (min_glissant, max_glissant) float32.
     """
     if radius <= 0:
         a = arr.astype(np.float32, copy=False)
@@ -166,8 +310,19 @@ def _rolling_nan_minmax(arr: np.ndarray, radius: int) -> tuple[np.ndarray, np.nd
 
 def _pixel_area_from_affine(transform) -> float:
     """
-    Aire d'un pixel en unités CRS² : |a*e - b*d|.
-    (OK aussi si rotation/skew)
+    Calcule l'aire d'un pixel dans les unités du CRS (ex. m² en EPSG:2154).
+
+    Formule générale (incluant rotation/skew) : |a*e - b*d|.
+
+    Parameters
+    ----------
+    transform :
+        Transform affine rasterio (src.transform).
+
+    Returns
+    -------
+    float
+        Aire d'un pixel.
     """
     a = float(getattr(transform, "a"))
     b = float(getattr(transform, "b"))
@@ -178,8 +333,20 @@ def _pixel_area_from_affine(transform) -> float:
 
 def _pixel_scales_from_affine(transform) -> tuple[float, float]:
     """
-    Échelle pixel en X et Y (m/pixel en LAMB93), robuste à la rotation.
-    sx = sqrt(a² + b²), sy = sqrt(d² + e²)
+    Estime l'échelle pixel en X et Y (m/pixel en EPSG:2154), robuste à la rotation.
+
+    sx = sqrt(a² + b²)
+    sy = sqrt(d² + e²)
+
+    Parameters
+    ----------
+    transform :
+        Transform affine rasterio.
+
+    Returns
+    -------
+    tuple[float, float]
+        (sx, sy) en unités du CRS / pixel.
     """
     a = float(getattr(transform, "a"))
     b = float(getattr(transform, "b"))
@@ -192,7 +359,19 @@ def _pixel_scales_from_affine(transform) -> tuple[float, float]:
 
 def _elliptical_structure(rx_px: int, ry_px: int) -> np.ndarray:
     """
-    Élément structurant elliptique (approx cercle métrique).
+    Construit un élément structurant elliptique (approximation d'un cercle métrique).
+
+    L'ellipse est définie par ses rayons en pixels (rx_px, ry_px).
+
+    Parameters
+    ----------
+    rx_px, ry_px : int
+        Rayons en pixels selon X et Y.
+
+    Returns
+    -------
+    np.ndarray
+        Matrice booléenne (élément structurant).
     """
     rx_px = max(0, int(rx_px))
     ry_px = max(0, int(ry_px))
@@ -220,8 +399,38 @@ def _compute_change_mask_interval_array(
     logger: logging.Logger,
 ) -> tuple[np.ndarray, dict]:
     """
-    Calcule le masque brut (0/1/255) sur la grille du raster newer (corrélation recalée).
-    Retourne (mask_uint8, profile_newer).
+    Calcule le masque brut (0/1/nodata) sur la grille du raster "newer".
+
+    Ici :
+    - newer = MNS corrélation recalé (grille de référence)
+    - older = MNS LiDAR (reprojeté localement sur la fenêtre courante)
+
+    Méthode "intervalle disjoint" (robuste à du bruit) :
+    - on calcule pour chaque pixel le min/max locaux sur une fenêtre (rayon cfg.window_radius),
+      séparément pour newer et older,
+    - changement si l'intervalle [new_min, new_max] est disjoint de [old_min, old_max],
+      en tenant compte de tolérances verticales.
+
+    Paramètres de tolérance :
+    - tol_low  : seuil pour détecter un abaissement (new < old - tol_low)
+    - tol_high : seuil pour détecter un rehaussement (new > old + tol_high)
+
+    Parameters
+    ----------
+    newer_path : Path
+        Raster "newer" (corrélation recalée).
+    older_path : Path
+        Raster "older" (LiDAR).
+    cfg : MaskConfig
+        Paramètres de calcul.
+    logger : logging.Logger
+        Logger (non utilisé directement ici mais conservé pour cohérence).
+
+    Returns
+    -------
+    tuple[np.ndarray, dict]
+        - mask : uint8 (0/1/nodata)
+        - profile : profil rasterio du masque (dtype/nodata/compression mis à jour)
     """
     tol_low, tol_high = _normalize_tolerance(cfg.z_tolerance_m)
 
@@ -289,7 +498,23 @@ def _compute_change_mask_interval_array(
 
 def _morpho_open(mask: np.ndarray, radius: int, nodata: int) -> np.ndarray:
     """
-    Open morphologique (érosion puis dilatation) sur mask binaire, en préservant nodata.
+    Applique une ouverture morphologique (érosion puis dilatation) sur un masque binaire.
+
+    Le nodata est préservé : les pixels nodata ne participent pas au calcul et restent nodata.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Masque uint8 (0/1/nodata).
+    radius : int
+        Rayon (pixels) de l'élément structurant carré (taille = 2*radius+1).
+    nodata : int
+        Valeur nodata du masque.
+
+    Returns
+    -------
+    np.ndarray
+        Masque uint8 après ouverture morphologique.
     """
     nod = (mask == nodata)
     change = (mask == 1)
@@ -307,7 +532,30 @@ def _morpho_open(mask: np.ndarray, radius: int, nodata: int) -> np.ndarray:
 
 def _remove_small_components(mask: np.ndarray, transform, min_area_m2: float, connectivity: int, nodata: int, logger: logging.Logger) -> np.ndarray:
     """
-    Supprime les composantes connexes dont l'aire < min_area_m2.
+    Supprime les composantes connexes dont l'aire est inférieure à un seuil.
+
+    Le seuil est exprimé en m² et converti en nombre minimal de pixels via l'aire pixel
+    déduite de la transform affine.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Masque uint8 (0/1/nodata).
+    transform :
+        Transform affine rasterio (pour estimer aire pixel).
+    min_area_m2 : float
+        Aire minimale des composantes à conserver (m²).
+    connectivity : int
+        Connectivité des composantes (4 ou 8).
+    nodata : int
+        Valeur nodata.
+    logger : logging.Logger
+        Logger (journalise les statistiques).
+
+    Returns
+    -------
+    np.ndarray
+        Masque uint8 filtré.
     """
     nod = (mask == nodata)
     change = (mask == 1)
@@ -347,8 +595,32 @@ def _remove_small_components(mask: np.ndarray, transform, min_area_m2: float, co
 
 def _buffer_mask_metric(mask: np.ndarray, transform, buffer_m: float, closing: bool, nodata: int) -> np.ndarray:
     """
-    Dilatation métrique (ellipse) sur le masque binaire, nodata préservé.
-    Option closing: dilatation puis érosion.
+    Applique un buffer métrique sur le masque binaire par opérations morphologiques.
+
+    Implementation :
+    - conversion du buffer (mètres) en rayons (pixels) selon l'échelle pixel (sx, sy),
+    - dilatation avec un élément structurant elliptique,
+    - optionnellement fermeture : dilatation suivie d'érosion.
+
+    Le nodata est préservé.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Masque uint8 (0/1/nodata).
+    transform :
+        Transform affine rasterio (pour estimer sx, sy).
+    buffer_m : float
+        Rayon de buffer (mètres).
+    closing : bool
+        Si True : fermeture (dilatation puis érosion), sinon dilatation seule.
+    nodata : int
+        Valeur nodata.
+
+    Returns
+    -------
+    np.ndarray
+        Masque uint8 après buffer.
     """
     nod = (mask == nodata)
     change = (mask == 1)
@@ -371,6 +643,18 @@ def _buffer_mask_metric(mask: np.ndarray, transform, buffer_m: float, closing: b
 
 
 def _write_mask(mask: np.ndarray, profile: dict, out_path: Path) -> None:
+    """
+    Écrit un masque raster (bande 1) sur disque.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Masque uint8.
+    profile : dict
+        Profil rasterio (dtype, nodata, transform, crs, compression, etc.).
+    out_path : Path
+        Chemin de sortie.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(mask, 1)
@@ -378,12 +662,28 @@ def _write_mask(mask: np.ndarray, profile: dict, out_path: Path) -> None:
 
 def run_creation_masque(paths: ProjectPaths, cfg: MaskConfig) -> None:
     """
-    Crée un masque final par dalle, en comparant:
-      - newer = MNS corrélation recalé (paths.mns_recale)
-      - older = MNS LiDAR (paths.mns_lidar)
+    Crée les masques de changement (un par dalle) en comparant :
 
-    Sortie:
-      - masque final (0/1/255) dans paths.masque, même identifiant de dalle que corr.
+    - newer = MNS corrélation recalé : `paths.mns_recale`
+    - older = MNS LiDAR             : `paths.mns_lidar`
+
+    Sortie :
+    - masque final (0/1/nodata) écrit dans `paths.masque`,
+      nommé : MASK_CHANGE_XXXX_YYYY.tif
+
+    Parameters
+    ----------
+    paths : ProjectPaths
+        Arborescence du projet.
+    cfg : MaskConfig
+        Paramètres de création du masque.
+
+    Raises
+    ------
+    RuntimeError
+        Si aucune dalle n'est trouvée dans `paths.mns_recale`.
+    MissingMatchingTileError
+        Si une dalle LiDAR correspondante ne peut pas être trouvée.
     """
     logger = setup_logger(paths.logs, name="creation_masque")
 

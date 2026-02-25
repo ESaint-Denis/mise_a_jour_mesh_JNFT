@@ -13,6 +13,10 @@ Ce dépôt implémente une chaîne de traitement modulaire permettant de :
 - découper en tuiles kilométriques,
 - générer des **3D Tiles** pour visualisation web.
 
+Le schéma de principe de cette mise à jour est le suivant : 
+<p align="center">
+  <img src="img/schema_principe_mise_a_jour_mesh.png" alt="Schéma de principe" width="800">
+</p>
 ---
 
 ## Contexte

@@ -17,6 +17,7 @@ Le schéma de principe de cette mise à jour est le suivant :
 <p align="center">
   <img src="img/schema_principe_mise_a_jour_mesh.png" alt="Schéma de principe" width="800">
 </p>
+
 ---
 
 ## Contexte
